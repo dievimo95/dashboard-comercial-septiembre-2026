@@ -254,7 +254,7 @@ with tab1:
     urgent = analysis[analysis["status"].isin(["No hay stock", "Falta stock"])].head(10)
     for _, row in urgent.iterrows():
         with st.container(border=True):
-            st.markdown(f"**{row.status} · {row.code}** — {row.product}")
+            st.markdown(f"**{row['status']} · {row['code']}** — {row['product']}")
             st.caption(f"Forecast {row.forecast:,.0f} · Vendido {row.sold:,.0f} · Stock {row.available:,.0f}")
             st.markdown(f"**{row.action}**")
 
