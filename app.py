@@ -253,7 +253,10 @@ with tab1:
     st.subheader("Atención inmediata")
     urgent = analysis[analysis["status"].isin(["No hay stock", "Falta stock"])].head(10)
     for _, row in urgent.iterrows():
-        st.markdown(f'<div class="action-card"><b style="color:{COLORS[row.status]}">{row.status}</b> &nbsp; <b>{row.code}</b> — {row.product}<br><span class="small">Forecast {row.forecast:,.0f} · Vendido {row.sold:,.0f} · Stock {row.available:,.0f}</span><br><b>{row.action}</b></div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(f"**{row.status} · {row.code}** — {row.product}")
+            st.caption(f"Forecast {row.forecast:,.0f} · Vendido {row.sold:,.0f} · Stock {row.available:,.0f}")
+            st.markdown(f"**{row.action}**")
 
 with tab2:
     chosen = st.multiselect("Mostrar estados", list(COLORS), default=["No hay stock", "Falta stock", "Va lento", "Hay que venderlo"])
