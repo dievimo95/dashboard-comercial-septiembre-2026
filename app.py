@@ -193,30 +193,118 @@ def build_analysis(forecast, stock, invoices, cutoff):
     return master.sort_values(["priority", "missing_stock"], ascending=[True, False]).reset_index(drop=True), elapsed
 
 
+def file_signature(file):
+    return None if file is None else (file.name, len(file.getvalue()))
+
+
+def validate_bundle(forecast_data, stock_data, invoice_data, new_invoice_data=None):
+    errors, warnings = [], []
+    if forecast_data.empty:
+        errors.append("El forecast no contiene productos.")
+    if forecast_data["code"].isna().any() or forecast_data["code"].duplicated().any():
+        errors.append("El forecast tiene códigos vacíos o duplicados.")
+    if stock_data.empty:
+        errors.append("El stock no contiene productos.")
+    if stock_data["code"].isna().any() or stock_data["code"].duplicated().any():
+        errors.append("El stock tiene códigos vacíos o duplicados.")
+    if invoice_data.empty:
+        errors.append("No se pudieron leer líneas de producto en las facturas.")
+    required_invoice = {"invoice", "date", "code", "quantity", "net_sales"}
+    if not required_invoice.issubset(invoice_data.columns):
+        errors.append("Las facturas no contienen todos los campos necesarios.")
+    elif invoice_data[list(required_invoice)].isna().any().any():
+        errors.append("Existen líneas de factura incompletas.")
+    if new_invoice_data is not None and not new_invoice_data.empty:
+        master_codes = set(forecast_data["code"]) | set(stock_data["code"])
+        outside = sorted(set(new_invoice_data["code"]) - master_codes)
+        if outside:
+            warnings.append(f"{len(outside)} códigos facturados no están en forecast ni stock: {', '.join(outside[:8])}")
+    return errors, warnings
+
+
+if "active_bundle" not in st.session_state:
+    f0, s0, l0, i0, c0 = sample_frames()
+    st.session_state.active_bundle = {"forecast": f0, "stock": s0, "lots": l0, "invoices": i0, "cutoff": c0}
+
 with st.sidebar:
     st.header("Actualizar información")
-    st.caption("Puede usar el ejemplo actual o cargar un nuevo corte.")
+    st.caption("Puede subir solo las facturas nuevas. El forecast y el stock actuales se conservan si no carga otros archivos.")
     forecast_file = st.file_uploader("Forecast (.xlsx)", type="xlsx")
     stock_file = st.file_uploader("Stock (.xlsx)", type="xlsx")
-    pdf_file = st.file_uploader("Facturas (.pdf)", type="pdf")
-    use_sample = st.checkbox("Usar datos actuales de septiembre", value=True)
+    pdf_file = st.file_uploader("Facturas nuevas (.pdf)", type="pdf")
+    signature = (file_signature(forecast_file), file_signature(stock_file), file_signature(pdf_file))
+    if st.session_state.get("validated_signature") != signature:
+        st.session_state.pop("validated_bundle", None)
+        st.session_state.pop("validation_summary", None)
 
-try:
-    if forecast_file and stock_file and pdf_file:
-        forecast_df = read_forecast(forecast_file)
-        stock_df, lots_df = read_stock(stock_file)
-        invoice_df = read_pdf(pdf_file)
-        cutoff = pd.to_datetime(invoice_df["date"]).max()
-        source_label = "Archivos cargados"
-    elif use_sample and SAMPLE.exists():
-        forecast_df, stock_df, lots_df, invoice_df, cutoff = sample_frames()
-        source_label = "Corte actual: 9 de septiembre de 2026"
-    else:
-        st.info("Cargue los tres archivos para comenzar.")
-        st.stop()
-except Exception as exc:
-    st.error(f"No pude leer uno de los archivos: {exc}")
-    st.stop()
+    if st.button("Prevalidar información", type="primary", use_container_width=True):
+        try:
+            active = st.session_state.active_bundle
+            candidate_forecast = read_forecast(forecast_file) if forecast_file else active["forecast"].copy()
+            if stock_file:
+                candidate_stock, candidate_lots = read_stock(stock_file)
+            else:
+                candidate_stock, candidate_lots = active["stock"].copy(), active["lots"].copy()
+
+            new_invoices = read_pdf(pdf_file) if pdf_file else pd.DataFrame(columns=active["invoices"].columns)
+            combined_invoices = pd.concat([active["invoices"], new_invoices], ignore_index=True)
+            duplicate_key = ["invoice", "date", "code", "quantity", "net_sales"]
+            duplicated = int(combined_invoices.duplicated(duplicate_key).sum())
+            combined_invoices = combined_invoices.drop_duplicates(duplicate_key, keep="first")
+            cutoff_candidate = pd.to_datetime(combined_invoices["date"]).max()
+            errors, warnings = validate_bundle(candidate_forecast, candidate_stock, combined_invoices, new_invoices)
+
+            st.session_state.validated_signature = signature
+            st.session_state.validation_summary = {
+                "errors": errors,
+                "warnings": warnings,
+                "new_lines": len(new_invoices),
+                "new_invoices": int(new_invoices["invoice"].nunique()) if not new_invoices.empty else 0,
+                "duplicates": duplicated,
+                "date_min": new_invoices["date"].min() if not new_invoices.empty else None,
+                "date_max": new_invoices["date"].max() if not new_invoices.empty else None,
+            }
+            if not errors:
+                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "cutoff": cutoff_candidate}
+        except Exception as exc:
+            st.session_state.validated_signature = signature
+            st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "new_lines": 0, "new_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None}
+            st.session_state.pop("validated_bundle", None)
+
+    summary = st.session_state.get("validation_summary")
+    if summary:
+        if summary["errors"]:
+            st.error("Prevalidación no aprobada")
+            for message in summary["errors"]:
+                st.write(f"• {message}")
+        else:
+            st.success("Información conforme")
+            if summary["new_lines"]:
+                st.write(f"**{summary['new_invoices']}** facturas y **{summary['new_lines']}** líneas leídas.")
+                st.write(f"Fechas: **{pd.Timestamp(summary['date_min']).strftime('%d-%b-%Y')}** a **{pd.Timestamp(summary['date_max']).strftime('%d-%b-%Y')}**.")
+            else:
+                st.write("No se cargaron facturas nuevas.")
+            if summary["duplicates"]:
+                st.info(f"Se encontraron {summary['duplicates']} líneas ya cargadas. No se duplicarán.")
+            for message in summary["warnings"]:
+                st.warning(message)
+
+    can_update = "validated_bundle" in st.session_state and not (summary or {}).get("errors")
+    if st.button("Cargar y actualizar dashboard", disabled=not can_update, use_container_width=True):
+        st.session_state.active_bundle = st.session_state.validated_bundle
+        st.session_state.pop("validated_bundle", None)
+        st.session_state.pop("validation_summary", None)
+        st.success("Dashboard actualizado.")
+        st.rerun()
+
+active = st.session_state.active_bundle
+forecast_df = active["forecast"]
+stock_df = active["stock"]
+lots_df = active["lots"]
+invoice_df = active["invoices"]
+cutoff = pd.Timestamp(active["cutoff"])
+month_names = {1:"enero", 2:"febrero", 3:"marzo", 4:"abril", 5:"mayo", 6:"junio", 7:"julio", 8:"agosto", 9:"septiembre", 10:"octubre", 11:"noviembre", 12:"diciembre"}
+source_label = f"Corte actual: {cutoff.day} de {month_names[cutoff.month]} de {cutoff.year}"
 
 analysis, elapsed = build_analysis(forecast_df, stock_df, invoice_df, cutoff)
 sold_forecast = analysis.loc[analysis["forecast"].notna(), "sold"].sum()
