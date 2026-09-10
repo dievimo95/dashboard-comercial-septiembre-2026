@@ -133,6 +133,16 @@ def sample_frames():
     return forecast, stock_summary, lots, invoices, pd.Timestamp(data["as_of"])
 
 
+def blank_bundle():
+    return {
+        "forecast": pd.DataFrame(columns=["code", "product", "handling_unit", "forecast"]),
+        "stock": pd.DataFrame(columns=["code", "product", "available", "quantity", "expiry"]),
+        "lots": pd.DataFrame(columns=["code", "product", "location", "lot", "available", "quantity", "expiry", "uom", "company"]),
+        "invoices": pd.DataFrame(columns=["invoice", "date", "week", "customer", "code", "quantity", "unit_price", "net_sales", "pdf_page"]),
+        "cutoff": pd.NaT,
+    }
+
+
 def build_analysis(forecast, stock, invoices, cutoff):
     sold = invoices.groupby("code", as_index=False).agg(sold=("quantity", "sum"), net_sales=("net_sales", "sum"))
     master = forecast.merge(stock[["code", "available", "quantity", "expiry"]], on="code", how="outer")
@@ -223,15 +233,37 @@ def validate_bundle(forecast_data, stock_data, invoice_data, new_invoice_data=No
 
 
 if "active_bundle" not in st.session_state:
-    f0, s0, l0, i0, c0 = sample_frames()
-    st.session_state.active_bundle = {"forecast": f0, "stock": s0, "lots": l0, "invoices": i0, "cutoff": c0}
+    st.session_state.active_bundle = blank_bundle()
+if "upload_generation" not in st.session_state:
+    st.session_state.upload_generation = 0
 
 with st.sidebar:
     st.header("Actualizar información")
-    st.caption("Puede subir solo las facturas nuevas. El forecast y el stock actuales se conservan si no carga otros archivos.")
-    forecast_file = st.file_uploader("Forecast (.xlsx)", type="xlsx")
-    stock_file = st.file_uploader("Stock (.xlsx)", type="xlsx")
-    pdf_file = st.file_uploader("Facturas nuevas (.pdf)", type="pdf")
+    has_current_data = not st.session_state.active_bundle["forecast"].empty
+    if has_current_data:
+        st.caption("Puede subir solo las facturas nuevas. El forecast y el stock actuales se conservan si no carga otros archivos.")
+    else:
+        st.info("Nuevo mes: cargue forecast, stock y facturas para comenzar.")
+
+    if st.button("🗓️ Iniciar nuevo mes", use_container_width=True):
+        st.session_state.reset_pending = True
+    if st.session_state.get("reset_pending"):
+        st.warning("Esto quitará de la pantalla todos los datos actuales.")
+        confirm_col, cancel_col = st.columns(2)
+        if confirm_col.button("Sí, dejar en blanco", type="primary", use_container_width=True):
+            st.session_state.active_bundle = blank_bundle()
+            st.session_state.upload_generation += 1
+            for key in ["validated_bundle", "validation_summary", "validated_signature", "reset_pending"]:
+                st.session_state.pop(key, None)
+            st.rerun()
+        if cancel_col.button("Cancelar", use_container_width=True):
+            st.session_state.pop("reset_pending", None)
+            st.rerun()
+
+    generation = st.session_state.upload_generation
+    forecast_file = st.file_uploader("Forecast (.xlsx)", type="xlsx", key=f"forecast_{generation}")
+    stock_file = st.file_uploader("Stock (.xlsx)", type="xlsx", key=f"stock_{generation}")
+    pdf_file = st.file_uploader("Facturas nuevas (.pdf)", type="pdf", key=f"pdf_{generation}")
     signature = (file_signature(forecast_file), file_signature(stock_file), file_signature(pdf_file))
     if st.session_state.get("validated_signature") != signature:
         st.session_state.pop("validated_bundle", None)
@@ -251,7 +283,7 @@ with st.sidebar:
             duplicate_key = ["invoice", "date", "code", "quantity", "net_sales"]
             duplicated = int(combined_invoices.duplicated(duplicate_key).sum())
             combined_invoices = combined_invoices.drop_duplicates(duplicate_key, keep="first")
-            cutoff_candidate = pd.to_datetime(combined_invoices["date"]).max()
+            cutoff_candidate = pd.to_datetime(combined_invoices["date"]).max() if not combined_invoices.empty else pd.NaT
             errors, warnings = validate_bundle(candidate_forecast, candidate_stock, combined_invoices, new_invoices)
 
             st.session_state.validated_signature = signature
@@ -302,6 +334,17 @@ forecast_df = active["forecast"]
 stock_df = active["stock"]
 lots_df = active["lots"]
 invoice_df = active["invoices"]
+
+if forecast_df.empty or stock_df.empty or invoice_df.empty:
+    st.markdown('<div class="hero"><h1>Control comercial</h1><p>Comience un nuevo mes cargando la información.</p></div>', unsafe_allow_html=True)
+    st.title("La aplicación está en blanco")
+    st.write("Para crear el análisis del mes, cargue en el panel izquierdo:")
+    st.write("1. **Forecast del mes** en Excel")
+    st.write("2. **Stock disponible** en Excel")
+    st.write("3. **Facturas del mes** en PDF")
+    st.info("Después pulse **Prevalidar información**. Si los datos están conformes, se habilitará **Cargar y actualizar dashboard**.")
+    st.stop()
+
 cutoff = pd.Timestamp(active["cutoff"])
 month_names = {1:"enero", 2:"febrero", 3:"marzo", 4:"abril", 5:"mayo", 6:"junio", 7:"julio", 8:"agosto", 9:"septiembre", 10:"octubre", 11:"noviembre", 12:"diciembre"}
 source_label = f"Corte actual: {cutoff.day} de {month_names[cutoff.month]} de {cutoff.year}"
