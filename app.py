@@ -94,6 +94,7 @@ def read_stock(file):
 
 def read_pdf(file):
     invoice_re = re.compile(r"No\.:\s*(\d{3}-\d{3}-\d{9})")
+    issue_date_re = re.compile(r"(?:Fecha de emisi[oó]n:|Issue Date:)\s*(\d{2}/\d{2}/\d{4})", re.I)
     auth_date_re = re.compile(r"(?:N[uú]mero de autorizaci[oó]n:|Authorization No\.:)\s*\n?(\d{8})", re.I)
     spanish = re.compile(r"^(\d{8})\s+.*?\s([\d.]+,\d{4})\s+([\d.]+,\d{5})\s+.*?\$\s*([\d.]+,\d{2})$")
     english = re.compile(r"^(\d{8})\s+.*?\s([\d,]+\.\d{4})\s+([\d,]+\.\d{5})\s+.*?\$\s*([\d,]+\.\d{2})$")
@@ -105,8 +106,11 @@ def read_pdf(file):
             inv = invoice_re.search(text)
             if inv:
                 invoice = inv.group(1)
+                issued = issue_date_re.search(text)
                 auth = auth_date_re.search(text)
-                if auth:
+                if issued:
+                    date = datetime.strptime(issued.group(1), "%d/%m/%Y")
+                elif auth:
                     date = datetime.strptime(auth.group(1), "%d%m%Y")
                 lines = text.splitlines()
                 customer = ""
@@ -299,12 +303,13 @@ with st.sidebar:
                 "duplicates": duplicated,
                 "date_min": new_invoices["date"].min() if not new_invoices.empty else None,
                 "date_max": new_invoices["date"].max() if not new_invoices.empty else None,
+                "cutoff": cutoff_candidate,
             }
             if not errors:
                 st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "cutoff": cutoff_candidate}
         except Exception as exc:
             st.session_state.validated_signature = signature
-            st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "new_lines": 0, "new_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None}
+            st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "new_lines": 0, "new_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None, "cutoff": None}
             st.session_state.pop("validated_bundle", None)
 
     summary = st.session_state.get("validation_summary")
@@ -320,6 +325,8 @@ with st.sidebar:
                 st.write(f"Fechas: **{pd.Timestamp(summary['date_min']).strftime('%d-%b-%Y')}** a **{pd.Timestamp(summary['date_max']).strftime('%d-%b-%Y')}**.")
             else:
                 st.write("No se cargaron facturas nuevas.")
+            if summary.get("cutoff") is not None and not pd.isna(summary["cutoff"]):
+                st.write(f"**Fecha de corte que usará el dashboard: {pd.Timestamp(summary['cutoff']).strftime('%d/%m/%Y')}**")
             if summary["duplicates"]:
                 st.info(f"Se encontraron {summary['duplicates']} líneas ya cargadas. No se duplicarán.")
             for message in summary["warnings"]:
