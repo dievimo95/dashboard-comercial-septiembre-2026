@@ -14,6 +14,7 @@ st.set_page_config(page_title="Control comercial", page_icon="📊", layout="wid
 
 BASE = Path(__file__).resolve().parent
 SAMPLE = BASE / "sample_data.json"
+APP_DATA_VERSION = "nuevo-mes-en-blanco-v1"
 
 COLORS = {
     "No hay stock": "#d73027",
@@ -232,8 +233,11 @@ def validate_bundle(forecast_data, stock_data, invoice_data, new_invoice_data=No
     return errors, warnings
 
 
-if "active_bundle" not in st.session_state:
+if st.session_state.get("app_data_version") != APP_DATA_VERSION:
     st.session_state.active_bundle = blank_bundle()
+    st.session_state.app_data_version = APP_DATA_VERSION
+    for stale_key in ["validated_bundle", "validation_summary", "validated_signature", "reset_pending"]:
+        st.session_state.pop(stale_key, None)
 if "upload_generation" not in st.session_state:
     st.session_state.upload_generation = 0
 
