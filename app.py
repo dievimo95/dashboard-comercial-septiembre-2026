@@ -490,6 +490,8 @@ if isinstance(storage_result, dict):
                 st.session_state.storage_notice = "Se recuperó el último corte guardado en este navegador."
             except Exception as exc:
                 st.session_state.storage_notice = f"No pude recuperar la copia del navegador: {exc}"
+        elif not st.session_state.active_bundle["forecast"].empty:
+            st.session_state.storage_command = {"action": "save", "revision": uuid.uuid4().hex, "payload": pack_bundle(st.session_state.active_bundle)}
         st.rerun()
     elif storage_result.get("action") in ["saved", "cleared"] and storage_result.get("revision") == command["revision"]:
         st.session_state.storage_command = {"action": "load", "revision": command["revision"], "payload": ""}
