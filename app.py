@@ -255,9 +255,23 @@ def parse_order_pdfs(files, forecast, stock):
         for _, item in catalog.iterrows():
             match = re.search(r"\b\d{13}\b", str(item["product"]))
             if match and pd.notna(item["code"]):
-                barcode_candidates.setdefault(match.group(), set()).add(str(item["code"]))
+                code = str(item["code"])
+                candidate = barcode_candidates.setdefault(match.group(), {}).setdefault(code, set())
+                if "handling_unit" in catalog.columns and pd.notna(item.get("handling_unit")):
+                    candidate.add(float(item["handling_unit"]))
     barcode_to_sku.update({barcode: next(iter(codes)) for barcode, codes in barcode_candidates.items() if len(codes) == 1})
     ambiguous_barcodes = {barcode for barcode, codes in barcode_candidates.items() if len(codes) > 1}
+
+    def resolve_barcode(barcode, units_per_case):
+        candidates = barcode_candidates.get(barcode, {})
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        if len(candidates) > 1 and units_per_case is not None:
+            matches = [code for code, handling_units in candidates.items() if float(units_per_case) in handling_units]
+            if len(matches) == 1:
+                return matches[0]
+            return ""
+        return barcode_to_sku.get(barcode, "")
     for file in files:
         pdf = pdfplumber.open(io.BytesIO(file.getvalue()))
         documents.append((file.name, pdf))
@@ -311,7 +325,7 @@ def parse_order_pdfs(files, forecast, stock):
                                 continue
                             if packs <= 0 or uxc <= 0:
                                 continue
-                            sku = reference if len(reference) == 8 else barcode_to_sku.get(reference, "")
+                            sku = reference if len(reference) == 8 else resolve_barcode(reference, uxc)
                             rows.append({"Cliente": "El Rosado", "Orden": order_id, "Producto en pedido": str(line[2] or "").replace("\n", " "), "Referencia cliente": reference, "Cajas": packs, "Unidades por caja": uxc, "Unidades pedidas": packs * uxc, "Código SKU": sku, "Archivo": filename})
                             found += 1
                 elif "CORPORACION FAVORITA" in text and "Pedida" in text:
@@ -331,7 +345,7 @@ def parse_order_pdfs(files, forecast, stock):
                             barcode, uxc, packs = match.groups()
                             packs, uxc = float(packs), float(uxc)
                             description = line[2:match.start()].strip()
-                            rows.append({"Cliente": "Supermaxi", "Orden": order_id, "Producto en pedido": description, "Referencia cliente": barcode, "Cajas": packs, "Unidades por caja": uxc, "Unidades pedidas": packs * uxc, "Código SKU": barcode_to_sku.get(barcode, ""), "Archivo": filename})
+                            rows.append({"Cliente": "Supermaxi", "Orden": order_id, "Producto en pedido": description, "Referencia cliente": barcode, "Cajas": packs, "Unidades por caja": uxc, "Unidades pedidas": packs * uxc, "Código SKU": resolve_barcode(barcode, uxc), "Archivo": filename})
                             found += 1
             if not found:
                 errors.append(f"{filename}: no reconocí líneas de pedido. Revise el formato del PDF.")
@@ -343,6 +357,7 @@ def parse_order_pdfs(files, forecast, stock):
         result["Revisión"] = result.apply(
             lambda line: "Código de barras ambiguo: revise SKU" if not line["Código SKU"] and line["Referencia cliente"] in ambiguous_barcodes
             else "SKU no identificado: complete código" if not line["Código SKU"]
+            else "Empatado por unidades por caja: confirme SKU" if line["Referencia cliente"] in ambiguous_barcodes
             else "Confirme código y unidades", axis=1,
         )
     return result, errors
