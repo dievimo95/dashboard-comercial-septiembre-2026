@@ -673,9 +673,23 @@ with tab6:
                     st.error(message)
                 if not pdf_lines.empty:
                     st.write(f"Se leyeron **{len(pdf_lines)} líneas** de **{len(order_pdfs)} archivos**; total provisional: **{pdf_lines['Unidades pedidas'].sum():,.0f} unidades**.")
-                    st.caption("Revise especialmente los códigos vacíos y las cantidades. Puede corregir 'Código SKU' y 'Unidades pedidas' en la tabla.")
+                    st.caption("Rojo = producto cuyo SKU debe corregirse. Verde = SKU identificado. Puede editar 'Código SKU' y 'Unidades pedidas' en la tabla.")
+                    review_edits = st.session_state.get("pdf_order_review", {}).get("edited_rows", {})
+                    current_codes = pdf_lines["Código SKU"].fillna("").astype(str).str.strip().copy()
+                    for row_index, changes in review_edits.items():
+                        if "Código SKU" in changes:
+                            current_codes.iloc[int(row_index)] = str(changes["Código SKU"] or "").strip()
+                    needs_review = current_codes.map(lambda code: not re.fullmatch(r"\d{8}", code))
+                    colored_lines = pdf_lines.style.apply(
+                        lambda column: [
+                            "background-color: #ffe2e2; color: #8b1010; font-weight: 700" if needs_review.iloc[position]
+                            else "background-color: #e0f3e7; color: #176238"
+                            for position in range(len(column))
+                        ],
+                        subset=["Producto en pedido", "Revisión"],
+                    )
                     edited_lines = st.data_editor(
-                        pdf_lines, width="stretch", hide_index=True, num_rows="fixed",
+                        colored_lines, width="stretch", hide_index=True, num_rows="fixed",
                         key="pdf_order_review",
                         disabled=["Cliente", "Orden", "Producto en pedido", "Referencia cliente", "Cajas", "Unidades por caja", "Archivo", "Revisión"],
                         column_config={"Código SKU": st.column_config.TextColumn(help="Código interno de 8 dígitos"), "Unidades pedidas": st.column_config.NumberColumn(min_value=0, step=1)},
@@ -685,6 +699,9 @@ with tab6:
                     invalid_quantities = pd.to_numeric(edited_lines["Unidades pedidas"], errors="coerce").isna() | (pd.to_numeric(edited_lines["Unidades pedidas"], errors="coerce") <= 0)
                     if invalid.any():
                         st.warning(f"Faltan o son inválidos {int(invalid.sum())} códigos SKU. Corríjalos en la tabla antes de obtener el resultado completo.")
+                        st.write("**Productos que necesitan un código:**")
+                        for _, pending in edited_lines.loc[invalid, ["Cliente", "Producto en pedido", "Referencia cliente"]].iterrows():
+                            st.markdown(f":red[🔴 {pending['Producto en pedido']}] · {pending['Cliente']} · referencia {pending['Referencia cliente']}")
                     if invalid_quantities.any():
                         st.error(f"Revise {int(invalid_quantities.sum())} cantidades vacías o no positivas.")
                     if not invalid.any() and not invalid_quantities.any() and not pdf_errors:
