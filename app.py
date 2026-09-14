@@ -222,6 +222,132 @@ def prepare_weekly_order(raw, code_column, quantity_column):
     return order.groupby("code", as_index=False)["ordered"].sum()
 
 
+def order_number(value):
+    return float(str(value).strip().replace(".", "").replace(",", ".")) if "," in str(value) else float(str(value).strip())
+
+
+def tia_mappings(pdf):
+    client_to_sku, barcode_to_sku = {}, {}
+    for page in pdf.pages:
+        for table in page.extract_tables():
+            for row in table:
+                if len(row) < 10:
+                    continue
+                client = re.sub(r"\D", "", str(row[0] or ""))
+                barcode = re.sub(r"\D", "", str(row[5] or ""))
+                sku = re.sub(r"\D", "", str(row[7] or ""))
+                if len(client) == 9 and len(sku) == 8 and sku != client:
+                    client_to_sku[client] = sku
+                    if len(barcode) == 13:
+                        barcode_to_sku[barcode] = sku
+    return client_to_sku, barcode_to_sku
+
+
+def parse_order_pdfs(files, forecast, stock):
+    documents = []
+    client_to_sku, barcode_to_sku = {}, {
+        "7862123515891": "01020019", "7862123513842": "03020007",
+        "7862123515495": "01020014", "7862123510391": "01020002",
+        "7862123516430": "13020001", "7862123516447": "13020002",
+    }
+    barcode_candidates = {}
+    for catalog in [forecast, stock]:
+        for _, item in catalog.iterrows():
+            match = re.search(r"\b\d{13}\b", str(item["product"]))
+            if match and pd.notna(item["code"]):
+                barcode_candidates.setdefault(match.group(), set()).add(str(item["code"]))
+    barcode_to_sku.update({barcode: next(iter(codes)) for barcode, codes in barcode_candidates.items() if len(codes) == 1})
+    ambiguous_barcodes = {barcode for barcode, codes in barcode_candidates.items() if len(codes) > 1}
+    for file in files:
+        pdf = pdfplumber.open(io.BytesIO(file.getvalue()))
+        documents.append((file.name, pdf))
+        tia, barcodes = tia_mappings(pdf)
+        client_to_sku.update(tia)
+        barcode_to_sku.update(barcodes)
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                for line in table:
+                    if len(line) < 8:
+                        continue
+                    client = re.sub(r"\D", "", str(line[0] or ""))
+                    barcode = re.sub(r"\D", "", str(line[5] or ""))
+                    if len(client) == 9 and barcode in barcode_to_sku:
+                        client_to_sku[client] = barcode_to_sku[barcode]
+
+    rows, errors = [], []
+    try:
+        for filename, pdf in documents:
+            found = 0
+            for page_no, page in enumerate(pdf.pages, 1):
+                text = page.extract_text() or ""
+                if "Resultado De La Homologación" in text or "TIENDAS INDUSTRIALES ASOCIADAS" in text:
+                    order_match = re.search(r"ORDEN DE COMPRA N[º°]\s*(\d+)", text)
+                    order_id = order_match.group(1) if order_match else f"página {page_no}"
+                    for table in page.extract_tables():
+                        for line in table:
+                            if len(line) < 11:
+                                continue
+                            client_code = re.sub(r"\D", "", str(line[10] or ""))
+                            try:
+                                units = order_number(line[0])
+                            except (ValueError, TypeError):
+                                continue
+                            if len(client_code) != 9 or units <= 0:
+                                continue
+                            rows.append({"Cliente": "TIA", "Orden": order_id, "Producto en pedido": str(line[6] or "").replace("\n", " "), "Referencia cliente": client_code, "Cajas": order_number(line[1]) if line[1] else None, "Unidades por caja": None, "Unidades pedidas": units, "Código SKU": client_to_sku.get(client_code, ""), "Archivo": filename})
+                            found += 1
+                elif "CORPORACION EL ROSADO" in text:
+                    for table in page.extract_tables():
+                        if len(table) < 6 or not any("NUMERO DE ORDEN" in str(cell) for line in table[:5] for cell in line):
+                            continue
+                        order_id = next((str(line[2]) for line in table if str(line[0]).startswith("NUMERO DE ORDEN")), f"página {page_no}")
+                        for line in table:
+                            if len(line) < 9 or not str(line[0] or "").isdigit() or not str(line[1] or "").isdigit():
+                                continue
+                            reference = re.sub(r"\D", "", str(line[5] or ""))
+                            try:
+                                packs, uxc = order_number(line[8]), order_number(line[7])
+                            except (ValueError, TypeError):
+                                continue
+                            if packs <= 0 or uxc <= 0:
+                                continue
+                            sku = reference if len(reference) == 8 else barcode_to_sku.get(reference, "")
+                            rows.append({"Cliente": "El Rosado", "Orden": order_id, "Producto en pedido": str(line[2] or "").replace("\n", " "), "Referencia cliente": reference, "Cajas": packs, "Unidades por caja": uxc, "Unidades pedidas": packs * uxc, "Código SKU": sku, "Archivo": filename})
+                            found += 1
+                elif "CORPORACION FAVORITA" in text and "Pedida" in text:
+                    blocks = re.split(r"(?=Tda/Alm/CDI:)", text)
+                    for block_no, block in enumerate(blocks, 1):
+                        if "IT D e s c r i p c i o n" not in block:
+                            continue
+                        order_match = re.search(r"ORDEN COMPRA[^\n]*?\s(\d{5})\s*\n", block)
+                        order_id = order_match.group(1) if order_match else f"página {page_no}, bloque {block_no}"
+                        for line in block.splitlines():
+                            if not re.match(r"^\d{2}[A-Z]", line):
+                                continue
+                            match = re.search(r"\*?\s*(\d{13})\s+(\d+)\s+\d+\.\d+.*?\s+(\d+(?:\.\d+)?)$", line)
+                            if not match:
+                                errors.append(f"{filename}: no pude leer una línea de Supermaxi: {line[:85]}")
+                                continue
+                            barcode, uxc, packs = match.groups()
+                            packs, uxc = float(packs), float(uxc)
+                            description = line[2:match.start()].strip()
+                            rows.append({"Cliente": "Supermaxi", "Orden": order_id, "Producto en pedido": description, "Referencia cliente": barcode, "Cajas": packs, "Unidades por caja": uxc, "Unidades pedidas": packs * uxc, "Código SKU": barcode_to_sku.get(barcode, ""), "Archivo": filename})
+                            found += 1
+            if not found:
+                errors.append(f"{filename}: no reconocí líneas de pedido. Revise el formato del PDF.")
+    finally:
+        for _, pdf in documents:
+            pdf.close()
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result["Revisión"] = result.apply(
+            lambda line: "Código de barras ambiguo: revise SKU" if not line["Código SKU"] and line["Referencia cliente"] in ambiguous_barcodes
+            else "SKU no identificado: complete código" if not line["Código SKU"]
+            else "Confirme código y unidades", axis=1,
+        )
+    return result, errors
+
+
 def analyze_weekly_order(order, forecast, stock, invoices):
     billed = invoices[["code", "invoice", "quantity"]].copy()
     billed["type"] = billed["invoice"].astype(str).map(
@@ -535,9 +661,37 @@ with tab5:
 with tab6:
     st.subheader("¿Cabe el pedido de esta semana en el forecast?")
     st.caption("Forecast pendiente = forecast del mes − unidades ya facturadas. Se cuentan tanto facturas normales (001-100) como de exportación (001-901). Todas las cantidades son unidades individuales.")
-    entry_method = st.radio("Cómo ingresar el pedido", ["Subir archivo", "Escribir pedido"], horizontal=True)
+    entry_method = st.radio("Cómo ingresar el pedido", ["Subir PDF de clientes", "Subir Excel o CSV", "Escribir pedido"], horizontal=True)
     weekly_order = pd.DataFrame(columns=["code", "ordered"])
-    if entry_method == "Subir archivo":
+    if entry_method == "Subir PDF de clientes":
+        order_pdfs = st.file_uploader("Pedidos de TIA, El Rosado o Supermaxi (.pdf)", type="pdf", accept_multiple_files=True, key="weekly_order_pdfs")
+        st.caption("Puede cargar varios pedidos a la vez. La aplicación convierte cajas × unidades por caja y muestra los SKU para revisión antes de analizar.")
+        if order_pdfs:
+            try:
+                pdf_lines, pdf_errors = parse_order_pdfs(order_pdfs, forecast_df, stock_df)
+                for message in pdf_errors:
+                    st.error(message)
+                if not pdf_lines.empty:
+                    st.write(f"Se leyeron **{len(pdf_lines)} líneas** de **{len(order_pdfs)} archivos**; total provisional: **{pdf_lines['Unidades pedidas'].sum():,.0f} unidades**.")
+                    st.caption("Revise especialmente los códigos vacíos y las cantidades. Puede corregir 'Código SKU' y 'Unidades pedidas' en la tabla.")
+                    edited_lines = st.data_editor(
+                        pdf_lines, width="stretch", hide_index=True, num_rows="fixed",
+                        key="pdf_order_review",
+                        disabled=["Cliente", "Orden", "Producto en pedido", "Referencia cliente", "Cajas", "Unidades por caja", "Archivo", "Revisión"],
+                        column_config={"Código SKU": st.column_config.TextColumn(help="Código interno de 8 dígitos"), "Unidades pedidas": st.column_config.NumberColumn(min_value=0, step=1)},
+                    )
+                    codes = edited_lines["Código SKU"].fillna("").astype(str).str.strip()
+                    invalid = codes.map(lambda code: not re.fullmatch(r"\d{8}", code))
+                    invalid_quantities = pd.to_numeric(edited_lines["Unidades pedidas"], errors="coerce").isna() | (pd.to_numeric(edited_lines["Unidades pedidas"], errors="coerce") <= 0)
+                    if invalid.any():
+                        st.warning(f"Faltan o son inválidos {int(invalid.sum())} códigos SKU. Corríjalos en la tabla antes de obtener el resultado completo.")
+                    if invalid_quantities.any():
+                        st.error(f"Revise {int(invalid_quantities.sum())} cantidades vacías o no positivas.")
+                    if not invalid.any() and not invalid_quantities.any() and not pdf_errors:
+                        weekly_order = prepare_weekly_order(edited_lines, "Código SKU", "Unidades pedidas")
+            except Exception as exc:
+                st.error(f"No pude leer los PDF de pedidos: {exc}")
+    elif entry_method == "Subir Excel o CSV":
         order_file = st.file_uploader("Pedido semanal (.xlsx o .csv)", type=["xlsx", "csv"], key="weekly_order_file")
         st.caption("El archivo debe incluir una columna de código de producto y otra de cantidad solicitada. Puede elegirlas abajo.")
         if order_file is not None:
@@ -592,6 +746,6 @@ with tab6:
         )
         st.caption("Que el pedido quepa en el forecast no garantiza entrega inmediata: el stock puede ser parcial porque hay producción bajo pedido. El pedido no se descuenta ni se factura automáticamente. Si ya aparece en las facturas cargadas, no lo ingrese otra vez.")
     else:
-        st.info("Ingrese al menos un código y una cantidad para ver si puede cumplir el pedido.")
+        st.info("Cargue los pedidos y confirme sus códigos y cantidades para comparar el pedido con el forecast pendiente.")
 
 st.caption("Regla: el stock usa Cantidad disponible. Va lento si el avance está más de 10 puntos por debajo del tiempo transcurrido; va más rápido si está más de 10 puntos por encima.")
