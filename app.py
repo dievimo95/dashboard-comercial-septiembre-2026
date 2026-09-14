@@ -212,6 +212,47 @@ def file_signature(file):
     return None if file is None else (file.name, len(file.getvalue()))
 
 
+def prepare_weekly_order(raw, code_column, quantity_column):
+    order = raw[[code_column, quantity_column]].copy()
+    order.columns = ["code", "ordered"]
+    order["code"] = order["code"].map(norm_code)
+    order["ordered"] = pd.to_numeric(order["ordered"], errors="coerce")
+    order = order.dropna(subset=["code", "ordered"])
+    order = order[order["ordered"] > 0]
+    return order.groupby("code", as_index=False)["ordered"].sum()
+
+
+def analyze_weekly_order(order, forecast, stock, invoices):
+    billed = invoices[["code", "invoice", "quantity"]].copy()
+    billed["type"] = billed["invoice"].astype(str).map(
+        lambda number: "export" if number.startswith("001-901-") else "normal" if number.startswith("001-100-") else "other"
+    )
+    sold = billed.pivot_table(index="code", columns="type", values="quantity", aggfunc="sum", fill_value=0).reset_index()
+    for invoice_type in ["normal", "export", "other"]:
+        if invoice_type not in sold:
+            sold[invoice_type] = 0
+    sold["sold"] = sold[["normal", "export", "other"]].sum(axis=1)
+    names = pd.concat([forecast[["code", "product"]], stock[["code", "product"]]]).drop_duplicates("code")
+    result = order.merge(forecast[["code", "forecast"]], on="code", how="left")
+    result = result.merge(stock[["code", "available"]], on="code", how="left")
+    result = result.merge(sold, on="code", how="left")
+    result = result.merge(names, on="code", how="left")
+    result["available"] = pd.to_numeric(result["available"], errors="coerce").fillna(0).clip(lower=0)
+    for column in ["normal", "export", "other", "sold"]:
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0)
+    result["forecast_remaining"] = (result["forecast"] - result["sold"]).clip(lower=0)
+    result["fits_forecast"] = result[["ordered", "forecast_remaining"]].fillna(0).min(axis=1)
+    result["outside_forecast"] = result["ordered"] - result["fits_forecast"]
+    result["forecast_after_order"] = (result["forecast_remaining"] - result["ordered"]).clip(lower=0)
+    result["status"] = result.apply(
+        lambda row: "Sin forecast" if pd.isna(row["forecast"])
+        else "Supera el forecast" if row["outside_forecast"] > 0
+        else "Cabe en el forecast", axis=1,
+    )
+    result["product"] = result["product"].fillna("Producto no identificado")
+    return result.sort_values(["outside_forecast", "ordered"], ascending=False).reset_index(drop=True)
+
+
 def validate_bundle(forecast_data, stock_data, invoice_data, new_invoice_data=None):
     errors, warnings = [], []
     if forecast_data.empty:
@@ -377,7 +418,7 @@ if sold_forecast / forecast_total > elapsed:
 else:
     st.warning(f"En general vamos atrasados: se vendió {sold_forecast / forecast_total:.1%} del forecast y ha pasado {elapsed:.1%} del mes.")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente", "Pedido semanal"])
 
 with tab1:
     left, right = st.columns([1, 1])
@@ -421,5 +462,136 @@ with tab4:
     fig.update_layout(title="Unidades facturadas por semana", xaxis_title="Semana", yaxis_title="Unidades", height=330)
     st.plotly_chart(fig, width="stretch")
     st.dataframe(invoice_df.sort_values("date", ascending=False), width="stretch", hide_index=True)
+
+with tab5:
+    customer_sales = invoice_df.copy()
+    customer_sales["customer"] = customer_sales["customer"].fillna("").str.strip().replace("", "Cliente sin identificar")
+    invoice_totals = customer_sales.groupby(["customer", "invoice", "date"], as_index=False).agg(
+        Unidades=("quantity", "sum"),
+        Venta_neta=("net_sales", "sum"),
+    )
+    customers = invoice_totals.groupby("customer", as_index=False).agg(
+        Facturas=("invoice", "nunique"),
+        Unidades=("Unidades", "sum"),
+        Venta_neta=("Venta_neta", "sum"),
+        Ultima_compra=("date", "max"),
+    )
+    customers["Ticket_promedio"] = customers["Venta_neta"] / customers["Facturas"].replace(0, pd.NA)
+    total_customer_sales = customers["Venta_neta"].sum()
+    customers["Participacion"] = customers["Venta_neta"] / total_customer_sales if total_customer_sales else 0
+    customers = customers.sort_values("Venta_neta", ascending=False).reset_index(drop=True)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Venta neta", f"${total_customer_sales:,.2f}")
+    m2.metric("Clientes", f"{customers['customer'].nunique():,.0f}")
+    m3.metric("Facturas", f"{invoice_totals['invoice'].nunique():,.0f}")
+    average_ticket = total_customer_sales / max(invoice_totals["invoice"].nunique(), 1)
+    m4.metric("Ticket promedio", f"${average_ticket:,.2f}")
+
+    st.subheader("¿Quiénes nos están comprando más?")
+    top_customers = customers.head(15).sort_values("Venta_neta")
+    fig = px.bar(
+        top_customers,
+        x="Venta_neta",
+        y="customer",
+        orientation="h",
+        text_auto="$.2s",
+        color="Venta_neta",
+        color_continuous_scale=["#9fbad0", "#1f6d8c"],
+    )
+    fig.update_layout(height=max(380, len(top_customers) * 34), xaxis_title="Venta neta en dólares", yaxis_title="Cliente", coloraxis_showscale=False)
+    st.plotly_chart(fig, width="stretch")
+
+    st.subheader("Resumen por cliente")
+    customer_table = customers.rename(columns={
+        "customer": "Cliente",
+        "Venta_neta": "Venta neta",
+        "Ticket_promedio": "Ticket promedio",
+        "Participacion": "% de la venta",
+        "Ultima_compra": "Última compra",
+    })
+    st.dataframe(
+        customer_table[["Cliente", "Venta neta", "% de la venta", "Facturas", "Ticket promedio", "Unidades", "Última compra"]],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Venta neta": st.column_config.NumberColumn(format="$%,.2f"),
+            "% de la venta": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.1%%"),
+            "Ticket promedio": st.column_config.NumberColumn(format="$%,.2f"),
+            "Unidades": st.column_config.NumberColumn(format="%,.0f"),
+            "Última compra": st.column_config.DateColumn(format="DD/MM/YYYY"),
+        },
+    )
+
+    selected_customer = st.selectbox("Ver las facturas de un cliente", customers["customer"].tolist())
+    selected_invoices = invoice_totals[invoice_totals["customer"] == selected_customer].sort_values("date", ascending=False)
+    st.dataframe(
+        selected_invoices.rename(columns={"invoice": "Factura", "date": "Fecha", "Venta_neta": "Venta neta"})[["Factura", "Fecha", "Unidades", "Venta neta"]],
+        width="stretch",
+        hide_index=True,
+        column_config={"Fecha": st.column_config.DateColumn(format="DD/MM/YYYY"), "Unidades": st.column_config.NumberColumn(format="%,.0f"), "Venta neta": st.column_config.NumberColumn(format="$%,.2f")},
+    )
+
+with tab6:
+    st.subheader("¿Cabe el pedido de esta semana en el forecast?")
+    st.caption("Forecast pendiente = forecast del mes − unidades ya facturadas. Se cuentan tanto facturas normales (001-100) como de exportación (001-901). Todas las cantidades son unidades individuales.")
+    entry_method = st.radio("Cómo ingresar el pedido", ["Subir archivo", "Escribir pedido"], horizontal=True)
+    weekly_order = pd.DataFrame(columns=["code", "ordered"])
+    if entry_method == "Subir archivo":
+        order_file = st.file_uploader("Pedido semanal (.xlsx o .csv)", type=["xlsx", "csv"], key="weekly_order_file")
+        st.caption("El archivo debe incluir una columna de código de producto y otra de cantidad solicitada. Puede elegirlas abajo.")
+        if order_file is not None:
+            try:
+                raw_order = pd.read_csv(order_file, sep=None, engine="python", dtype=str) if order_file.name.lower().endswith(".csv") else pd.read_excel(order_file, dtype=str)
+                if len(raw_order.columns) < 2:
+                    st.error("El pedido necesita al menos dos columnas: código y cantidad.")
+                else:
+                    cols = list(raw_order.columns)
+                    code_guess = next((i for i, col in enumerate(cols) if any(term in str(col).lower() for term in ["cód", "cod", "sku"])), 0)
+                    quantity_guess = next((i for i, col in enumerate(cols) if any(term in str(col).lower() for term in ["cant", "unid", "pedido"])), min(1, len(cols) - 1))
+                    left, right = st.columns(2)
+                    code_col = left.selectbox("Columna de código", cols, index=code_guess)
+                    quantity_col = right.selectbox("Columna de cantidad", cols, index=quantity_guess)
+                    if code_col == quantity_col:
+                        st.error("Seleccione columnas distintas para código y cantidad.")
+                    else:
+                        weekly_order = prepare_weekly_order(raw_order, code_col, quantity_col)
+            except Exception as exc:
+                st.error(f"No pude leer el pedido: {exc}")
+    else:
+        typed_order = st.data_editor(
+            pd.DataFrame({"Código": [""], "Cantidad": [None]}),
+            num_rows="dynamic", hide_index=True, width="stretch", key="weekly_order_editor",
+            column_config={"Código": st.column_config.TextColumn(help="Código/SKU de 8 dígitos"), "Cantidad": st.column_config.NumberColumn(min_value=1, step=1)},
+        )
+        weekly_order = prepare_weekly_order(typed_order, "Código", "Cantidad")
+
+    if not weekly_order.empty:
+        order_analysis = analyze_weekly_order(weekly_order, forecast_df, stock_df, invoice_df)
+        total_ordered = order_analysis["ordered"].sum()
+        total_fitting = order_analysis["fits_forecast"].sum()
+        total_outside = order_analysis["outside_forecast"].sum()
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Pedido semanal", f"{total_ordered:,.0f} unidades")
+        p2.metric("Cabe en el forecast", f"{total_fitting:,.0f} unidades")
+        p3.metric("Sobre el forecast", f"{total_outside:,.0f} unidades")
+        p4.metric("Cobertura del forecast", f"{total_fitting / total_ordered:.1%}")
+        if total_outside:
+            st.warning(f"El pedido supera el forecast pendiente en {total_outside:,.0f} unidades de {int((order_analysis['outside_forecast'] > 0).sum())} productos. Revise si debe ampliar el forecast o programar producción adicional.")
+        else:
+            st.success("Todo el pedido semanal cabe dentro del forecast aún no facturado.")
+        missing_forecast = order_analysis["forecast"].isna().sum()
+        if missing_forecast:
+            st.warning(f"{missing_forecast} códigos del pedido no aparecen en el forecast; revise si deben incluirse.")
+        st.dataframe(
+            order_analysis[["code", "product", "forecast", "normal", "export", "other", "sold", "forecast_remaining", "ordered", "fits_forecast", "outside_forecast", "forecast_after_order", "available", "status"]].rename(columns={
+                "code": "Código", "product": "Producto", "forecast": "Forecast del mes", "normal": "Facturado normal", "export": "Facturado exportación", "other": "Otras facturas", "sold": "Total facturado", "forecast_remaining": "Forecast pendiente", "ordered": "Pedido semanal", "fits_forecast": "Cabe en forecast", "outside_forecast": "Sobre forecast", "forecast_after_order": "Forecast tras pedido", "available": "Stock informado", "status": "Estado",
+            }),
+            width="stretch", hide_index=True,
+            column_config={"Código": st.column_config.TextColumn()},
+        )
+        st.caption("Que el pedido quepa en el forecast no garantiza entrega inmediata: el stock puede ser parcial porque hay producción bajo pedido. El pedido no se descuenta ni se factura automáticamente. Si ya aparece en las facturas cargadas, no lo ingrese otra vez.")
+    else:
+        st.info("Ingrese al menos un código y una cantidad para ver si puede cumplir el pedido.")
 
 st.caption("Regla: el stock usa Cantidad disponible. Va lento si el avance está más de 10 puntos por debajo del tiempo transcurrido; va más rápido si está más de 10 puntos por encima.")
