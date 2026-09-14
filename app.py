@@ -245,6 +245,7 @@ def tia_mappings(pdf):
 
 def parse_order_pdfs(files, forecast, stock):
     documents = []
+    known_skus = set(forecast["code"].dropna().astype(str)) | set(stock["code"].dropna().astype(str))
     client_to_sku, barcode_to_sku = {}, {
         "7862123515891": "01020019", "7862123513842": "03020007",
         "7862123515495": "01020014", "7862123510391": "01020002",
@@ -325,7 +326,12 @@ def parse_order_pdfs(files, forecast, stock):
                                 continue
                             if packs <= 0 or uxc <= 0:
                                 continue
-                            sku = reference if len(reference) == 8 else resolve_barcode(reference, uxc)
+                            if len(reference) == 8:
+                                sku = reference
+                            elif len(reference) == 7 and reference.zfill(8) in known_skus:
+                                sku = reference.zfill(8)
+                            else:
+                                sku = resolve_barcode(reference, uxc)
                             rows.append({"Cliente": "El Rosado", "Orden": order_id, "Producto en pedido": str(line[2] or "").replace("\n", " "), "Referencia cliente": reference, "Cajas": packs, "Unidades por caja": uxc, "Unidades pedidas": packs * uxc, "Código SKU": sku, "Archivo": filename})
                             found += 1
                 elif "CORPORACION FAVORITA" in text and "Pedida" in text:
@@ -357,6 +363,7 @@ def parse_order_pdfs(files, forecast, stock):
         result["Revisión"] = result.apply(
             lambda line: "Código de barras ambiguo: revise SKU" if not line["Código SKU"] and line["Referencia cliente"] in ambiguous_barcodes
             else "SKU no identificado: complete código" if not line["Código SKU"]
+            else "Código completado con cero inicial: confirme producto" if len(line["Referencia cliente"]) == 7 and line["Código SKU"] == line["Referencia cliente"].zfill(8)
             else "Empatado por unidades por caja: confirme SKU" if line["Referencia cliente"] in ambiguous_barcodes
             else "Confirme código y unidades", axis=1,
         )
