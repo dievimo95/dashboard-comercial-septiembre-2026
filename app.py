@@ -401,6 +401,14 @@ def analyze_weekly_order(order, forecast, stock, invoices):
     return result.sort_values(["outside_forecast", "ordered"], ascending=False).reset_index(drop=True)
 
 
+def forecast_signal(row):
+    if pd.isna(row["forecast"]) or row["outside_forecast"] > 0 or row["forecast_after_order"] <= 0:
+        return "🔴 Sin forecast"
+    if row["forecast_after_order"] <= row["forecast"] * 0.20:
+        return "🟡 Queda poco"
+    return "🟢 Hay margen"
+
+
 def validate_bundle(forecast_data, stock_data, invoice_data, new_invoice_data=None):
     errors, warnings = [], []
     if forecast_data.empty:
@@ -776,10 +784,22 @@ with tab6:
         missing_forecast = order_analysis["forecast"].isna().sum()
         if missing_forecast:
             st.warning(f"{missing_forecast} códigos del pedido no aparecen en el forecast; revise si deben incluirse.")
+        st.caption("Semáforo: 🔴 sin forecast o pedido que lo supera · 🟡 queda hasta el 20% del forecast mensual · 🟢 queda más del 20%.")
+        order_analysis["signal"] = order_analysis.apply(forecast_signal, axis=1)
+        forecast_table = order_analysis[["code", "product", "signal", "forecast", "normal", "export", "other", "sold", "forecast_remaining", "ordered", "fits_forecast", "outside_forecast", "forecast_after_order", "available", "status"]].rename(columns={
+            "code": "Código", "product": "Producto", "signal": "Semáforo", "forecast": "Forecast del mes", "normal": "Facturado normal", "export": "Facturado exportación", "other": "Otras facturas", "sold": "Total facturado", "forecast_remaining": "Forecast pendiente", "ordered": "Pedido semanal", "fits_forecast": "Cabe en forecast", "outside_forecast": "Sobre forecast", "forecast_after_order": "Forecast tras pedido", "available": "Stock informado", "status": "Estado",
+        })
+        color_by_signal = {
+            "🔴 Sin forecast": "background-color: #ffe1e1; color: #8b1010; font-weight: 700",
+            "🟡 Queda poco": "background-color: #fff1c7; color: #795200; font-weight: 700",
+            "🟢 Hay margen": "background-color: #dcf3e4; color: #176238; font-weight: 700",
+        }
+        styled_forecast = forecast_table.style.apply(
+            lambda column: [color_by_signal[forecast_table["Semáforo"].iloc[position]] for position in range(len(column))],
+            subset=["Producto", "Semáforo", "Forecast tras pedido"],
+        )
         st.dataframe(
-            order_analysis[["code", "product", "forecast", "normal", "export", "other", "sold", "forecast_remaining", "ordered", "fits_forecast", "outside_forecast", "forecast_after_order", "available", "status"]].rename(columns={
-                "code": "Código", "product": "Producto", "forecast": "Forecast del mes", "normal": "Facturado normal", "export": "Facturado exportación", "other": "Otras facturas", "sold": "Total facturado", "forecast_remaining": "Forecast pendiente", "ordered": "Pedido semanal", "fits_forecast": "Cabe en forecast", "outside_forecast": "Sobre forecast", "forecast_after_order": "Forecast tras pedido", "available": "Stock informado", "status": "Estado",
-            }),
+            styled_forecast,
             width="stretch", hide_index=True,
             column_config={"Código": st.column_config.TextColumn()},
         )
