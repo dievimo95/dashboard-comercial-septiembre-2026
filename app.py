@@ -1,6 +1,9 @@
 import io
 import json
 import re
+import base64
+import uuid
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -8,6 +11,7 @@ import pandas as pd
 import pdfplumber
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 st.set_page_config(page_title="Control comercial", page_icon="📊", layout="wide")
@@ -15,6 +19,7 @@ st.set_page_config(page_title="Control comercial", page_icon="📊", layout="wid
 BASE = Path(__file__).resolve().parent
 SAMPLE = BASE / "sample_data.json"
 APP_DATA_VERSION = "nuevo-mes-en-blanco-v1"
+browser_store = components.declare_component("control_comercial_browser_store", path=str(BASE / "browser_store"))
 
 COLORS = {
     "No hay stock": "#d73027",
@@ -146,6 +151,37 @@ def blank_bundle():
         "invoices": pd.DataFrame(columns=["invoice", "date", "week", "customer", "code", "quantity", "unit_price", "net_sales", "pdf_page"]),
         "cutoff": pd.NaT,
     }
+
+
+def pack_bundle(bundle):
+    data = {
+        "version": 1,
+        "tables": {name: bundle[name].to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices"]},
+        "cutoff": None if pd.isna(bundle["cutoff"]) else pd.Timestamp(bundle["cutoff"]).isoformat(),
+    }
+    return base64.b64encode(zlib.compress(json.dumps(data).encode("utf-8"), level=9)).decode("ascii")
+
+
+def unpack_bundle(encoded):
+    if not isinstance(encoded, str) or len(encoded) > 20_000_000:
+        raise ValueError("Copia guardada inválida o demasiado grande")
+    inflater = zlib.decompressobj()
+    raw = inflater.decompress(base64.b64decode(encoded, validate=True), 30_000_001)
+    if len(raw) > 30_000_000 or inflater.unconsumed_tail or not inflater.eof:
+        raise ValueError("Copia guardada demasiado grande o dañada")
+    data = json.loads(raw)
+    if data.get("version") != 1:
+        raise ValueError("Versión de copia no compatible")
+    bundle = blank_bundle()
+    for name in ["forecast", "stock", "lots", "invoices"]:
+        bundle[name] = pd.read_json(io.StringIO(data["tables"][name]), orient="records", dtype={"code": str}, convert_dates=False)
+    for name, column in [("stock", "expiry"), ("lots", "expiry"), ("invoices", "date")]:
+        if column in bundle[name]:
+            bundle[name][column] = pd.to_datetime(bundle[name][column], errors="coerce")
+    bundle["cutoff"] = pd.to_datetime(data["cutoff"]) if data.get("cutoff") else pd.NaT
+    if bundle["forecast"].empty or bundle["invoices"].empty:
+        raise ValueError("La copia no contiene forecast y facturas")
+    return bundle
 
 
 def build_analysis(forecast, stock, invoices, cutoff):
@@ -441,9 +477,31 @@ if st.session_state.get("app_data_version") != APP_DATA_VERSION:
         st.session_state.pop(stale_key, None)
 if "upload_generation" not in st.session_state:
     st.session_state.upload_generation = 0
+if "storage_command" not in st.session_state:
+    st.session_state.storage_command = {"action": "load", "revision": "initial", "payload": ""}
+command = st.session_state.storage_command
+storage_result = browser_store(**command, key="saved_commercial_cut")
+if isinstance(storage_result, dict):
+    if storage_result.get("action") == "loaded" and not st.session_state.get("storage_loaded"):
+        st.session_state.storage_loaded = True
+        if storage_result.get("payload"):
+            try:
+                st.session_state.active_bundle = unpack_bundle(storage_result["payload"])
+                st.session_state.storage_notice = "Se recuperó el último corte guardado en este navegador."
+            except Exception as exc:
+                st.session_state.storage_notice = f"No pude recuperar la copia del navegador: {exc}"
+        st.rerun()
+    elif storage_result.get("action") in ["saved", "cleared"] and storage_result.get("revision") == command["revision"]:
+        st.session_state.storage_command = {"action": "load", "revision": command["revision"], "payload": ""}
+        st.session_state.storage_notice = "Corte guardado en este navegador." if storage_result["action"] == "saved" else "Copia guardada eliminada."
+    elif storage_result.get("action") == "error":
+        st.session_state.storage_notice = f"No se pudo guardar en este navegador: {storage_result.get('message', 'error desconocido')}"
 
 with st.sidebar:
     st.header("Actualizar información")
+    st.caption("El corte validado se guarda en este navegador y vuelve al refrescar. No se comparte con otros usuarios. Conserve también sus archivos originales.")
+    if st.session_state.get("storage_notice"):
+        st.info(st.session_state.pop("storage_notice"))
     has_current_data = not st.session_state.active_bundle["forecast"].empty
     if has_current_data:
         st.caption("Puede subir solo las facturas nuevas. El forecast y el stock actuales se conservan si no carga otros archivos.")
@@ -457,6 +515,8 @@ with st.sidebar:
         confirm_col, cancel_col = st.columns(2)
         if confirm_col.button("Sí, dejar en blanco", type="primary", use_container_width=True):
             st.session_state.active_bundle = blank_bundle()
+            st.session_state.storage_loaded = True
+            st.session_state.storage_command = {"action": "clear", "revision": uuid.uuid4().hex, "payload": ""}
             st.session_state.upload_generation += 1
             for key in ["validated_bundle", "validation_summary", "validated_signature", "reset_pending"]:
                 st.session_state.pop(key, None)
@@ -532,6 +592,8 @@ with st.sidebar:
     can_update = "validated_bundle" in st.session_state and not (summary or {}).get("errors")
     if st.button("Cargar y actualizar dashboard", disabled=not can_update, use_container_width=True):
         st.session_state.active_bundle = st.session_state.validated_bundle
+        st.session_state.storage_loaded = True
+        st.session_state.storage_command = {"action": "save", "revision": uuid.uuid4().hex, "payload": pack_bundle(st.session_state.active_bundle)}
         st.session_state.pop("validated_bundle", None)
         st.session_state.pop("validation_summary", None)
         st.success("Dashboard actualizado.")
@@ -786,6 +848,11 @@ with tab6:
             st.warning(f"{missing_forecast} códigos del pedido no aparecen en el forecast; revise si deben incluirse.")
         st.caption("Semáforo: 🔴 sin forecast o pedido que lo supera · 🟡 queda hasta el 20% del forecast mensual · 🟢 queda más del 20%.")
         order_analysis["signal"] = order_analysis.apply(forecast_signal, axis=1)
+        signal_options = ["Todos", "🔴 Sin forecast", "🟡 Queda poco", "🟢 Hay margen"]
+        signal_filter = st.selectbox("Mostrar productos según forecast tras el pedido", signal_options, key="weekly_forecast_filter")
+        if signal_filter != "Todos":
+            order_analysis = order_analysis.loc[order_analysis["signal"] == signal_filter].copy()
+        st.caption(f"Mostrando {len(order_analysis)} productos de {len(weekly_order)} códigos del pedido.")
         forecast_table = order_analysis[["code", "product", "signal", "forecast", "normal", "export", "other", "sold", "forecast_remaining", "ordered", "fits_forecast", "outside_forecast", "forecast_after_order", "available", "status"]].rename(columns={
             "code": "Código", "product": "Producto", "signal": "Semáforo", "forecast": "Forecast del mes", "normal": "Facturado normal", "export": "Facturado exportación", "other": "Otras facturas", "sold": "Total facturado", "forecast_remaining": "Forecast pendiente", "ordered": "Pedido semanal", "fits_forecast": "Cabe en forecast", "outside_forecast": "Sobre forecast", "forecast_after_order": "Forecast tras pedido", "available": "Stock informado", "status": "Estado",
         })
@@ -794,15 +861,18 @@ with tab6:
             "🟡 Queda poco": "background-color: #fff1c7; color: #795200; font-weight: 700",
             "🟢 Hay margen": "background-color: #dcf3e4; color: #176238; font-weight: 700",
         }
-        styled_forecast = forecast_table.style.apply(
-            lambda column: [color_by_signal[forecast_table["Semáforo"].iloc[position]] for position in range(len(column))],
-            subset=["Producto", "Semáforo", "Forecast tras pedido"],
-        )
-        st.dataframe(
-            styled_forecast,
-            width="stretch", hide_index=True,
-            column_config={"Código": st.column_config.TextColumn()},
-        )
+        if forecast_table.empty:
+            st.info("No hay productos en esta categoría para el pedido cargado.")
+        else:
+            styled_forecast = forecast_table.style.apply(
+                lambda column: [color_by_signal[forecast_table["Semáforo"].iloc[position]] for position in range(len(column))],
+                subset=["Producto", "Semáforo", "Forecast tras pedido"],
+            )
+            st.dataframe(
+                styled_forecast,
+                width="stretch", hide_index=True,
+                column_config={"Código": st.column_config.TextColumn()},
+            )
         st.caption("Que el pedido quepa en el forecast no garantiza entrega inmediata: el stock puede ser parcial porque hay producción bajo pedido. El pedido no se descuenta ni se factura automáticamente. Si ya aparece en las facturas cargadas, no lo ingrese otra vez.")
     else:
         st.info("Cargue los pedidos y confirme sus códigos y cantidades para comparar el pedido con el forecast pendiente.")
