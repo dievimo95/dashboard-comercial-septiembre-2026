@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="es">
+<head><meta charset="utf-8"></head>
+<body style="margin:0;height:0;overflow:hidden">
+<script>
+  const storageKey = "control-comercial-corte-v1";
+  let lastRequest = null;
+
+  function send(value) {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setComponentValue",
+      dataType: "json",
+      value: value
+    }, "*");
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.data.type !== "streamlit:render") return;
+    const args = event.data.args || {};
+    const request = `${args.action || "load"}:${args.revision || ""}`;
+    if (request === lastRequest) return;
+    lastRequest = request;
+    try {
+      if (args.action === "save") {
+        localStorage.setItem(storageKey, args.payload);
+        send({ action: "saved", revision: args.revision });
+      } else if (args.action === "clear") {
+        localStorage.removeItem(storageKey);
+        send({ action: "cleared", revision: args.revision });
+      } else {
+        send({ action: "loaded", payload: localStorage.getItem(storageKey) });
+      }
+    } catch (error) {
+      send({ action: "error", message: String(error) });
+    }
+  });
+
+  window.parent.postMessage({
+    isStreamlitMessage: true,
+    type: "streamlit:componentReady",
+    apiVersion: 1
+  }, "*");
+  window.parent.postMessage({
+    isStreamlitMessage: true,
+    type: "streamlit:setFrameHeight",
+    height: 0
+  }, "*");
+</script>
+</body>
+</html>
