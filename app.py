@@ -729,14 +729,15 @@ with tab5:
         "Ticket_promedio": "Ticket promedio",
         "Participacion": "% de la venta",
         "Ultima_compra": "Última compra",
-    })
+    }).copy()
+    customer_table["% de la venta"] = customer_table["% de la venta"].map(lambda value: f"{value:.1%}")
     st.dataframe(
         customer_table[["Cliente", "Venta neta", "% de la venta", "Facturas", "Ticket promedio", "Unidades", "Última compra"]],
         width="stretch",
         hide_index=True,
         column_config={
             "Venta neta": st.column_config.NumberColumn(format="$%,.2f"),
-            "% de la venta": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.1%%"),
+            "% de la venta": st.column_config.TextColumn(width="small", help="Porcentaje de la venta neta total del mes"),
             "Ticket promedio": st.column_config.NumberColumn(format="$%,.2f"),
             "Unidades": st.column_config.NumberColumn(format="%,.0f"),
             "Última compra": st.column_config.DateColumn(format="DD/MM/YYYY"),
@@ -869,8 +870,8 @@ with tab6:
             return f"Quedan {show_units(row['forecast_after_order'])}"
 
         order_analysis["result_label"] = order_analysis.apply(order_result, axis=1)
-        forecast_table = order_analysis[["code", "product", "signal", "ordered", "forecast_remaining", "result_label"]].rename(columns={
-            "code": "Código", "product": "Producto", "signal": "Semáforo", "ordered": "Pedido", "forecast_remaining": "Forecast libre", "result_label": "Resultado",
+        forecast_table = order_analysis[["code", "product", "signal", "forecast", "sold", "forecast_remaining", "ordered", "result_label"]].rename(columns={
+            "code": "Código", "product": "Producto", "signal": "Semáforo", "forecast": "Forecast mes", "sold": "Facturado", "forecast_remaining": "Forecast libre", "ordered": "Pedido", "result_label": "Resultado",
         })
         color_by_signal = {
             "🔴 Sin forecast": "background-color: #ffe1e1; color: #8b1010; font-weight: 700",
@@ -880,7 +881,7 @@ with tab6:
         if forecast_table.empty:
             st.info("No hay productos en esta categoría para el pedido cargado.")
         else:
-            styled_forecast = forecast_table.style.format({"Pedido": show_units, "Forecast libre": show_units}).apply(
+            styled_forecast = forecast_table.style.format({column: show_units for column in ["Forecast mes", "Facturado", "Forecast libre", "Pedido"]}).apply(
                 lambda column: [color_by_signal[forecast_table["Semáforo"].iloc[position]] for position in range(len(column))],
                 subset=["Producto", "Semáforo", "Resultado"],
             )
