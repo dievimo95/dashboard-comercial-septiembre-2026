@@ -855,8 +855,22 @@ with tab6:
         if signal_filter != "Todos":
             order_analysis = order_analysis.loc[order_analysis["signal"] == signal_filter].copy()
         st.caption(f"Mostrando {len(order_analysis)} productos de {len(weekly_order)} códigos del pedido.")
-        forecast_table = order_analysis[["code", "product", "signal", "forecast", "normal", "export", "other", "sold", "forecast_remaining", "ordered", "fits_forecast", "outside_forecast", "forecast_after_order", "available", "status"]].rename(columns={
-            "code": "Código", "product": "Producto", "signal": "Semáforo", "forecast": "Forecast del mes", "normal": "Facturado normal", "export": "Facturado exportación", "other": "Otras facturas", "sold": "Total facturado", "forecast_remaining": "Forecast pendiente", "ordered": "Pedido semanal", "fits_forecast": "Cabe en forecast", "outside_forecast": "Sobre forecast", "forecast_after_order": "Forecast tras pedido", "available": "Stock informado", "status": "Estado",
+        def show_units(value):
+            if pd.isna(value) or value == 0:
+                return "—"
+            formatted = f"{value:,.3f}".rstrip("0").rstrip(".")
+            return formatted.replace(",", "_").replace(".", ",").replace("_", ".")
+
+        def order_result(row):
+            if row["outside_forecast"] > 0:
+                return f"Faltan {show_units(row['outside_forecast'])}"
+            if row["forecast_after_order"] <= 0:
+                return "Se agota"
+            return f"Quedan {show_units(row['forecast_after_order'])}"
+
+        order_analysis["result_label"] = order_analysis.apply(order_result, axis=1)
+        forecast_table = order_analysis[["code", "product", "signal", "ordered", "forecast_remaining", "result_label"]].rename(columns={
+            "code": "Código", "product": "Producto", "signal": "Semáforo", "ordered": "Pedido", "forecast_remaining": "Forecast libre", "result_label": "Resultado",
         })
         color_by_signal = {
             "🔴 Sin forecast": "background-color: #ffe1e1; color: #8b1010; font-weight: 700",
@@ -866,15 +880,21 @@ with tab6:
         if forecast_table.empty:
             st.info("No hay productos en esta categoría para el pedido cargado.")
         else:
-            styled_forecast = forecast_table.style.apply(
+            styled_forecast = forecast_table.style.format({"Pedido": show_units, "Forecast libre": show_units}).apply(
                 lambda column: [color_by_signal[forecast_table["Semáforo"].iloc[position]] for position in range(len(column))],
-                subset=["Producto", "Semáforo", "Forecast tras pedido"],
+                subset=["Producto", "Semáforo", "Resultado"],
             )
             st.dataframe(
                 styled_forecast,
                 width="stretch", hide_index=True,
-                column_config={"Código": st.column_config.TextColumn()},
+                column_config={"Código": st.column_config.TextColumn(width="small"), "Producto": st.column_config.TextColumn(width="large"), "Resultado": st.column_config.TextColumn(width="medium")},
             )
+            with st.expander("Ver detalle de forecast, facturas y stock"):
+                detail_table = order_analysis[["code", "product", "forecast", "normal", "export", "other", "sold", "forecast_remaining", "ordered", "outside_forecast", "forecast_after_order", "available"]].rename(columns={
+                    "code": "Código", "product": "Producto", "forecast": "Forecast del mes", "normal": "Facturado normal", "export": "Facturado exportación", "other": "Otras facturas", "sold": "Total facturado", "forecast_remaining": "Forecast libre", "ordered": "Pedido", "outside_forecast": "Faltan", "forecast_after_order": "Quedan", "available": "Stock informado",
+                })
+                numeric_columns = detail_table.select_dtypes(include="number").columns
+                st.dataframe(detail_table.style.format({column: show_units for column in numeric_columns}), width="stretch", hide_index=True, column_config={"Código": st.column_config.TextColumn()})
         st.caption("Que el pedido quepa en el forecast no garantiza entrega inmediata: el stock puede ser parcial porque hay producción bajo pedido. El pedido no se descuenta ni se factura automáticamente. Si ya aparece en las facturas cargadas, no lo ingrese otra vez.")
     else:
         st.info("Cargue los pedidos y confirme sus códigos y cantidades para comparar el pedido con el forecast pendiente.")
