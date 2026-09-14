@@ -672,9 +672,11 @@ with tab3:
     full = analysis.copy()
     if search:
         full = full[full["code"].str.contains(search, case=False, na=False) | full["product"].str.contains(search, case=False, na=False)]
-    full["Avance"] = full["advance"]
+    full["Avance"] = full["advance"].map(
+        lambda value: "—" if pd.isna(value) else f"{value:.1%}".replace(".", ",").replace("%", " %")
+    )
     show = full[["code", "product", "forecast", "sold", "Avance", "available", "remaining", "projection", "status", "action"]].rename(columns={"code":"Código", "product":"Producto", "forecast":"Forecast", "sold":"Vendido", "available":"Stock", "remaining":"Falta vender", "projection":"Proyección", "status":"Estado", "action":"Qué hacer"})
-    st.dataframe(show, width="stretch", hide_index=True, column_config={"Código": st.column_config.TextColumn(), "Avance": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.1%%"), "Forecast": st.column_config.NumberColumn(format="%,.0f"), "Vendido": st.column_config.NumberColumn(format="%,.0f"), "Stock": st.column_config.NumberColumn(format="%,.0f"), "Falta vender": st.column_config.NumberColumn(format="%,.0f"), "Proyección": st.column_config.NumberColumn(format="%,.0f")})
+    st.dataframe(show, width="stretch", hide_index=True, column_config={"Código": st.column_config.TextColumn(), "Avance": st.column_config.TextColumn(width="small"), "Forecast": st.column_config.NumberColumn(format="%,.0f"), "Vendido": st.column_config.NumberColumn(format="%,.0f"), "Stock": st.column_config.NumberColumn(format="%,.0f"), "Falta vender": st.column_config.NumberColumn(format="%,.0f"), "Proyección": st.column_config.NumberColumn(format="%,.0f")})
 
 with tab4:
     weekly = invoice_df.groupby("week", as_index=False).agg(Unidades=("quantity", "sum"), Venta_neta=("net_sales", "sum"))
