@@ -1079,22 +1079,24 @@ with tab7:
                 candidate = review.loc[~review["Ya guardada"] & ~review["Excluir"].fillna(False).astype(bool)].drop(columns=["Ya guardada", "Excluir"]).copy()
                 candidate["Código SKU"] = candidate["Código SKU"].map(norm_code)
                 invalid = candidate["Código SKU"].isna() | (pd.to_numeric(candidate["Unidades pedidas"], errors="coerce") <= 0)
+                invalid_count = int(invalid.sum())
+                valid_candidate = candidate.loc[~invalid].copy()
                 if repeated_files:
                     st.info(f"{repeated_files} líneas pertenecen a órdenes ya guardadas y se ignorarán.")
                 if excluded_count:
                     st.info(f"{excluded_count} líneas fueron excluidas y no entrarán al Fill Rate.")
-                if invalid.any():
-                    st.error(f"Corrija {int(invalid.sum())} líneas con SKU o cantidad inválidos antes de guardar.")
-                elif candidate.empty:
+                if invalid_count:
+                    st.warning(f"{invalid_count} líneas todavía no tienen un SKU válido. Puede corregirlas o guardar ahora: se excluirán automáticamente del Fill Rate.")
+                if valid_candidate.empty:
                     st.success("No hay líneas nuevas para guardar: ya estaban guardadas o fueron excluidas.")
-                elif st.button("Guardar órdenes sin duplicar", type="primary", key="save_fill_rate_orders"):
+                elif st.button("Guardar pedidos válidos y conciliar", type="primary", key="save_fill_rate_orders"):
                     line_key = ["Cliente", "Orden", "Código SKU", "Referencia cliente", "Unidades pedidas"]
-                    candidate = candidate.drop_duplicates(line_key, keep="first")
-                    combined_orders = pd.concat([orders_df, candidate], ignore_index=True)
+                    valid_candidate = valid_candidate.drop_duplicates(line_key, keep="first")
+                    combined_orders = pd.concat([orders_df, valid_candidate], ignore_index=True)
                     combined_orders = combined_orders.drop_duplicates(line_key, keep="first")
                     st.session_state.active_bundle["orders"] = combined_orders
                     st.session_state.storage_command = {"action": "save", "revision": uuid.uuid4().hex, "payload": pack_bundle(st.session_state.active_bundle)}
-                    st.session_state.storage_notice = f"Se guardaron {candidate['Orden'].nunique()} órdenes nuevas sin duplicar las existentes."
+                    st.session_state.storage_notice = f"Se guardaron {valid_candidate['Orden'].nunique()} órdenes nuevas y se conciliaron con las facturas disponibles."
                     st.rerun()
         except Exception as exc:
             st.error(f"No pude leer las órdenes de compra: {exc}")
