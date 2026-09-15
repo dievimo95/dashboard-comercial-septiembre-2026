@@ -71,6 +71,11 @@ def number_local(value):
     return float(value.replace(",", ""))
 
 
+def canonical_order(value):
+    """Comparable order key while preserving alphanumeric customer orders."""
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
 def read_forecast(file):
     df = pd.read_excel(file, sheet_name=0, header=3)
     df = df.iloc[:, :4]
@@ -103,7 +108,8 @@ def read_pdf(file):
     auth_date_re = re.compile(r"(?:N[uú]mero de autorizaci[oó]n:|Authorization No\.:)\s*\n?(\d{8})", re.I)
     spanish = re.compile(r"^(\d{8})\s+.*?\s([\d.]+,\d{4})\s+([\d.]+,\d{5})\s+.*?\$\s*([\d.]+,\d{2})$")
     english = re.compile(r"^(\d{8})\s+.*?\s([\d,]+\.\d{4})\s+([\d,]+\.\d{5})\s+.*?\$\s*([\d,]+\.\d{2})$")
-    records, invoice, date, customer = [], None, None, ""
+    purchase_order_re = re.compile(r"\bOC\s*:\s*([^\n]+)", re.I)
+    records, invoice, date, customer, order_by_invoice = [], None, None, "", {}
     source = io.BytesIO(file.getvalue()) if hasattr(file, "getvalue") else file
     with pdfplumber.open(source) as pdf:
         for page_no, page in enumerate(pdf.pages, 1):
@@ -123,13 +129,20 @@ def read_pdf(file):
                     if ("Nombres y apellidos:" in line or "Partner:" in line) and idx + 1 < len(lines):
                         customer = re.split(r"\s+(?:Fecha de vencimiento:|Due Date:)", lines[idx + 1])[0].strip()
                         break
+            if invoice:
+                order_match = purchase_order_re.search(text)
+                if order_match:
+                    order_by_invoice[invoice] = canonical_order(order_match.group(1))
             for raw in text.splitlines():
                 match = spanish.match(raw.strip()) or english.match(raw.strip())
                 if not match or not invoice or not date:
                     continue
                 qty, price, net = map(number_local, match.groups()[1:])
                 records.append({"invoice": invoice, "date": date, "week": 1 if date.day <= 7 else 2 if date.day <= 14 else 3 if date.day <= 21 else 4 if date.day <= 28 else 5, "customer": customer, "code": match.group(1), "quantity": qty, "unit_price": price, "net_sales": net, "pdf_page": page_no})
-    return pd.DataFrame(records)
+    result = pd.DataFrame(records)
+    if not result.empty:
+        result["purchase_order"] = result["invoice"].map(order_by_invoice).fillna("")
+    return result
 
 
 def sample_frames():
@@ -148,7 +161,8 @@ def blank_bundle():
         "forecast": pd.DataFrame(columns=["code", "product", "handling_unit", "forecast"]),
         "stock": pd.DataFrame(columns=["code", "product", "available", "quantity", "expiry"]),
         "lots": pd.DataFrame(columns=["code", "product", "location", "lot", "available", "quantity", "expiry", "uom", "company"]),
-        "invoices": pd.DataFrame(columns=["invoice", "date", "week", "customer", "code", "quantity", "unit_price", "net_sales", "pdf_page"]),
+        "invoices": pd.DataFrame(columns=["invoice", "date", "week", "customer", "code", "quantity", "unit_price", "net_sales", "pdf_page", "purchase_order"]),
+        "orders": pd.DataFrame(columns=["Cliente", "Orden", "Fecha pedido", "Fecha inicio", "Fecha límite", "Producto en pedido", "Referencia cliente", "Cajas", "Unidades por caja", "Unidades pedidas", "Código SKU", "Archivo", "Revisión"]),
         "weekly_order": pd.DataFrame(columns=["code", "ordered"]),
         "cutoff": pd.NaT,
     }
@@ -156,8 +170,8 @@ def blank_bundle():
 
 def pack_bundle(bundle):
     data = {
-        "version": 1,
-        "tables": {name: bundle.get(name, blank_bundle()[name]).to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices", "weekly_order"]},
+        "version": 2,
+        "tables": {name: bundle.get(name, blank_bundle()[name]).to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices", "orders", "weekly_order"]},
         "cutoff": None if pd.isna(bundle["cutoff"]) else pd.Timestamp(bundle["cutoff"]).isoformat(),
     }
     return base64.b64encode(zlib.compress(json.dumps(data).encode("utf-8"), level=9)).decode("ascii")
@@ -171,13 +185,13 @@ def unpack_bundle(encoded):
     if len(raw) > 30_000_000 or inflater.unconsumed_tail or not inflater.eof:
         raise ValueError("Copia guardada demasiado grande o dañada")
     data = json.loads(raw)
-    if data.get("version") != 1:
+    if data.get("version") not in [1, 2]:
         raise ValueError("Versión de copia no compatible")
     bundle = blank_bundle()
-    for name in ["forecast", "stock", "lots", "invoices", "weekly_order"]:
+    for name in ["forecast", "stock", "lots", "invoices", "orders", "weekly_order"]:
         if name in data["tables"]:
             bundle[name] = pd.read_json(io.StringIO(data["tables"][name]), orient="records", dtype={"code": str}, convert_dates=False)
-    for name, column in [("stock", "expiry"), ("lots", "expiry"), ("invoices", "date")]:
+    for name, column in [("stock", "expiry"), ("lots", "expiry"), ("invoices", "date"), ("orders", "Fecha pedido"), ("orders", "Fecha inicio"), ("orders", "Fecha límite")]:
         if column in bundle[name]:
             bundle[name][column] = pd.to_datetime(bundle[name][column], errors="coerce")
     bundle["cutoff"] = pd.to_datetime(data["cutoff"]) if data.get("cutoff") else pd.NaT
@@ -336,6 +350,11 @@ def parse_order_pdfs(files, forecast, stock):
                 if "Resultado De La Homologación" in text or "TIENDAS INDUSTRIALES ASOCIADAS" in text:
                     order_match = re.search(r"ORDEN DE COMPRA N[º°]\s*(\d+)", text)
                     order_id = order_match.group(1) if order_match else f"página {page_no}"
+                    window = re.search(r"Desde El:\s*Hasta El:\s*(\d{4}-\d{2}-\d{2})\s+(\d{4}-\d{2}-\d{2})", text)
+                    loaded = re.search(r"Fecha Carga:(\d{4}-\d{2}-\d{2})", text)
+                    order_date = pd.to_datetime(loaded.group(1)) if loaded else pd.NaT
+                    start_date = pd.to_datetime(window.group(1)) if window else pd.NaT
+                    end_date = pd.to_datetime(window.group(2)) if window else pd.NaT
                     for table in page.extract_tables():
                         for line in table:
                             if len(line) < 11:
@@ -347,13 +366,16 @@ def parse_order_pdfs(files, forecast, stock):
                                 continue
                             if len(client_code) != 9 or units <= 0:
                                 continue
-                            rows.append({"Cliente": "TIA", "Orden": order_id, "Producto en pedido": str(line[6] or "").replace("\n", " "), "Referencia cliente": client_code, "Cajas": order_number(line[1]) if line[1] else None, "Unidades por caja": None, "Unidades pedidas": units, "Código SKU": client_to_sku.get(client_code, ""), "Archivo": filename})
+                            rows.append({"Cliente": "TIA", "Orden": canonical_order(order_id), "Fecha pedido": order_date, "Fecha inicio": start_date, "Fecha límite": end_date, "Producto en pedido": str(line[6] or "").replace("\n", " "), "Referencia cliente": client_code, "Cajas": order_number(line[1]) if line[1] else None, "Unidades por caja": None, "Unidades pedidas": units, "Código SKU": client_to_sku.get(client_code, ""), "Archivo": filename})
                             found += 1
                 elif "CORPORACION EL ROSADO" in text:
                     for table in page.extract_tables():
                         if len(table) < 6 or not any("NUMERO DE ORDEN" in str(cell) for line in table[:5] for cell in line):
                             continue
                         order_id = next((str(line[2]) for line in table if str(line[0]).startswith("NUMERO DE ORDEN")), f"página {page_no}")
+                        dates = re.search(r"FECHA DEL\s*(\d{4}\.\d{2}\.\d{2})\s+FECHA DE\s*(\d{4}\.\d{2}\.\d{2})", text)
+                        order_date = pd.to_datetime(dates.group(1).replace(".", "-")) if dates else pd.NaT
+                        end_date = pd.to_datetime(dates.group(2).replace(".", "-")) if dates else pd.NaT
                         for line in table:
                             if len(line) < 9 or not str(line[0] or "").isdigit() or not str(line[1] or "").isdigit():
                                 continue
@@ -370,15 +392,26 @@ def parse_order_pdfs(files, forecast, stock):
                                 sku = reference.zfill(8)
                             else:
                                 sku = resolve_barcode(reference, uxc)
-                            rows.append({"Cliente": "El Rosado", "Orden": order_id, "Producto en pedido": str(line[2] or "").replace("\n", " "), "Referencia cliente": reference, "Cajas": packs, "Unidades por caja": uxc, "Unidades pedidas": packs * uxc, "Código SKU": sku, "Archivo": filename})
+                            rows.append({"Cliente": "El Rosado", "Orden": canonical_order(order_id), "Fecha pedido": order_date, "Fecha inicio": order_date, "Fecha límite": end_date, "Producto en pedido": str(line[2] or "").replace("\n", " "), "Referencia cliente": reference, "Cajas": packs, "Unidades por caja": uxc, "Unidades pedidas": packs * uxc, "Código SKU": sku, "Archivo": filename})
                             found += 1
                 elif "CORPORACION FAVORITA" in text and "Pedida" in text:
                     blocks = re.split(r"(?=Tda/Alm/CDI:)", text)
                     for block_no, block in enumerate(blocks, 1):
                         if "IT D e s c r i p c i o n" not in block:
                             continue
-                        order_match = re.search(r"ORDEN COMPRA[^\n]*?\s(\d{5})\s*\n", block)
-                        order_id = order_match.group(1) if order_match else f"página {page_no}, bloque {block_no}"
+                        order_match = re.search(r"ORDEN COMPRA[^\n]*?50\s*:\s*(\d+)\s+(\d+)\s+(\d+)", block)
+                        order_id = "".join(order_match.groups()) if order_match else f"página {page_no}, bloque {block_no}"
+                        elaborated = re.search(r"Fecha Elabora:\s*(\d{2}/[A-Z]{3}/\d{4})", block)
+                        valid = re.search(r"Fecha Vigencia:\s*(\d{2}/[A-Z]{3}/\d{4})", block)
+                        cancelled = re.search(r"Fecha Cancela:\s*(\d{2}/[A-Z]{3}/\d{4})", block)
+                        month_map = {"ENE":"JAN", "ABR":"APR", "AGO":"AUG", "DIC":"DEC"}
+                        def super_date(match):
+                            if not match:
+                                return pd.NaT
+                            value = match.group(1)
+                            for es, en in month_map.items():
+                                value = value.replace(es, en)
+                            return pd.to_datetime(value, format="%d/%b/%Y", errors="coerce")
                         for line in block.splitlines():
                             if not re.match(r"^\d{2}[A-Z]", line):
                                 continue
@@ -389,7 +422,7 @@ def parse_order_pdfs(files, forecast, stock):
                             barcode, uxc, packs = match.groups()
                             packs, uxc = float(packs), float(uxc)
                             description = line[2:match.start()].strip()
-                            rows.append({"Cliente": "Supermaxi", "Orden": order_id, "Producto en pedido": description, "Referencia cliente": barcode, "Cajas": packs, "Unidades por caja": uxc, "Unidades pedidas": packs * uxc, "Código SKU": resolve_barcode(barcode, uxc), "Archivo": filename})
+                            rows.append({"Cliente": "Supermaxi", "Orden": canonical_order(order_id), "Fecha pedido": super_date(elaborated), "Fecha inicio": super_date(valid), "Fecha límite": super_date(cancelled), "Producto en pedido": description, "Referencia cliente": barcode, "Cajas": packs, "Unidades por caja": uxc, "Unidades pedidas": packs * uxc, "Código SKU": resolve_barcode(barcode, uxc), "Archivo": filename})
                             found += 1
             if not found:
                 errors.append(f"{filename}: no reconocí líneas de pedido. Revise el formato del PDF.")
@@ -437,6 +470,54 @@ def analyze_weekly_order(order, forecast, stock, invoices):
     )
     result["product"] = result["product"].fillna("Producto no identificado")
     return result.sort_values(["outside_forecast", "ordered"], ascending=False).reset_index(drop=True)
+
+
+def reconcile_fill_rate(orders, invoices, as_of):
+    if orders.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    order_lines = orders.copy()
+    order_lines["Orden"] = order_lines["Orden"].map(canonical_order)
+    order_lines["Código SKU"] = order_lines["Código SKU"].map(norm_code)
+    order_lines["Unidades pedidas"] = pd.to_numeric(order_lines["Unidades pedidas"], errors="coerce").fillna(0)
+    order_lines = order_lines[order_lines["Código SKU"].notna() & (order_lines["Unidades pedidas"] > 0)]
+    keys = ["Cliente", "Orden", "Código SKU"]
+    line_summary = order_lines.groupby(keys, as_index=False).agg(
+        Fecha_pedido=("Fecha pedido", "min"), Fecha_inicio=("Fecha inicio", "min"), Fecha_limite=("Fecha límite", "max"),
+        Producto=("Producto en pedido", "first"), Unidades_pedidas=("Unidades pedidas", "sum"),
+    )
+    billed = invoices.copy()
+    if "purchase_order" not in billed:
+        billed["purchase_order"] = ""
+    billed["Orden"] = billed["purchase_order"].map(canonical_order)
+    billed["Código SKU"] = billed["code"].map(norm_code)
+    billed = billed[billed["Orden"].ne("")]
+    billed_summary = billed.groupby(["Orden", "Código SKU"], as_index=False).agg(
+        Unidades_facturadas=("quantity", "sum"), Facturas=("invoice", "nunique"), Ultima_factura=("date", "max")
+    )
+    detail = line_summary.merge(billed_summary, on=["Orden", "Código SKU"], how="left")
+    detail["Unidades_facturadas"] = pd.to_numeric(detail["Unidades_facturadas"], errors="coerce").fillna(0)
+    detail["Facturas"] = pd.to_numeric(detail["Facturas"], errors="coerce").fillna(0)
+    detail["Unidades_cumplidas"] = detail[["Unidades_pedidas", "Unidades_facturadas"]].min(axis=1)
+    detail["Pendiente"] = (detail["Unidades_pedidas"] - detail["Unidades_cumplidas"]).clip(lower=0)
+    detail["Fill_rate"] = detail["Unidades_cumplidas"] / detail["Unidades_pedidas"].replace(0, pd.NA)
+    today = pd.Timestamp(as_of).normalize()
+    detail["Estado_plazo"] = detail["Fecha_limite"].map(
+        lambda date: "Fecha sin identificar" if pd.isna(date) else "En plazo" if pd.Timestamp(date).normalize() >= today else "Vencida"
+    )
+    detail["Resultado"] = detail.apply(
+        lambda row: "Completa" if row["Pendiente"] <= 0 else "En plazo" if row["Estado_plazo"] == "En plazo" else "Incumplida" if row["Estado_plazo"] == "Vencida" else "Revisar", axis=1
+    )
+    summary = detail.groupby(["Cliente", "Orden"], as_index=False).agg(
+        Fecha_pedido=("Fecha_pedido", "min"), Fecha_inicio=("Fecha_inicio", "min"), Fecha_limite=("Fecha_limite", "max"),
+        Pedidas=("Unidades_pedidas", "sum"), Facturadas=("Unidades_cumplidas", "sum"), Pendientes=("Pendiente", "sum"),
+        Productos=("Código SKU", "nunique"), Productos_completos=("Pendiente", lambda values: int((values <= 0).sum())),
+        Facturas=("Facturas", "sum"), Estado_plazo=("Estado_plazo", "first"),
+    )
+    summary["Fill_rate"] = summary["Facturadas"] / summary["Pedidas"].replace(0, pd.NA)
+    summary["Resultado"] = summary.apply(
+        lambda row: "Completa" if row["Pendientes"] <= 0 else "En plazo" if row["Estado_plazo"] == "En plazo" else "Incumplida" if row["Estado_plazo"] == "Vencida" else "Revisar", axis=1
+    )
+    return summary.sort_values(["Fecha_limite", "Cliente"], ascending=[False, True]), detail
 
 
 def forecast_signal(row):
@@ -553,7 +634,9 @@ with st.sidebar:
                 candidate_stock, candidate_lots = active["stock"].copy(), active["lots"].copy()
 
             new_invoices = read_pdf(pdf_file) if pdf_file else pd.DataFrame(columns=active["invoices"].columns)
-            combined_invoices = pd.concat([active["invoices"], new_invoices], ignore_index=True)
+            # Put the newly parsed copy first so a repeated invoice can enrich an
+            # older saved line with its purchase-order number instead of losing it.
+            combined_invoices = pd.concat([new_invoices, active["invoices"]], ignore_index=True)
             duplicate_key = ["invoice", "date", "code", "quantity", "net_sales"]
             duplicated = int(combined_invoices.duplicated(duplicate_key).sum())
             combined_invoices = combined_invoices.drop_duplicates(duplicate_key, keep="first")
@@ -572,7 +655,7 @@ with st.sidebar:
                 "cutoff": cutoff_candidate,
             }
             if not errors:
-                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "weekly_order": active.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy(), "cutoff": cutoff_candidate}
+                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "orders": active.get("orders", blank_bundle()["orders"]).copy(), "weekly_order": active.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy(), "cutoff": cutoff_candidate}
         except Exception as exc:
             st.session_state.validated_signature = signature
             st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "new_lines": 0, "new_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None, "cutoff": None}
@@ -613,6 +696,7 @@ forecast_df = active["forecast"]
 stock_df = active["stock"]
 lots_df = active["lots"]
 invoice_df = active["invoices"]
+orders_df = active.get("orders", blank_bundle()["orders"])
 
 if forecast_df.empty or stock_df.empty or invoice_df.empty:
     st.markdown('<div class="hero"><h1>Control comercial</h1><p>Comience un nuevo mes cargando la información.</p></div>', unsafe_allow_html=True)
@@ -645,7 +729,7 @@ if sold_forecast / forecast_total > elapsed:
 else:
     st.warning(f"En general vamos atrasados: se vendió {sold_forecast / forecast_total:.1%} del forecast y ha pasado {elapsed:.1%} del mes.")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente", "Pedido semanal"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente", "Pedido semanal", "Fill Rate"])
 
 with tab1:
     left, right = st.columns([1, 1])
@@ -927,5 +1011,99 @@ with tab6:
         st.caption("Que el pedido quepa en el forecast no garantiza entrega inmediata: el stock puede ser parcial porque hay producción bajo pedido. El pedido no se descuenta ni se factura automáticamente. Si ya aparece en las facturas cargadas, no lo ingrese otra vez.")
     else:
         st.info("Cargue los pedidos y confirme sus códigos y cantidades para comparar el pedido con el forecast pendiente.")
+
+with tab7:
+    st.subheader("Fill Rate: ¿cuánto entregamos de cada orden?")
+    st.caption("La factura se concilia por número de orden de compra + SKU. Las órdenes que todavía no vencen se muestran 'En plazo' y no cuentan como incumplimiento.")
+
+    historical_order_files = st.file_uploader(
+        "Agregar órdenes de compra (.pdf)", type="pdf", accept_multiple_files=True, key="fill_rate_order_pdfs"
+    )
+    if historical_order_files:
+        try:
+            imported_orders, import_errors = parse_order_pdfs(historical_order_files, forecast_df, stock_df)
+            if import_errors:
+                for message in import_errors:
+                    st.warning(message)
+            if not imported_orders.empty:
+                imported_orders["Orden"] = imported_orders["Orden"].map(canonical_order)
+                existing_ids = set(zip(orders_df.get("Cliente", []), orders_df.get("Orden", []).map(canonical_order) if not orders_df.empty else []))
+                imported_orders["Ya guardada"] = imported_orders.apply(lambda row: (row["Cliente"], row["Orden"]) in existing_ids, axis=1)
+                repeated_files = int(imported_orders["Ya guardada"].sum())
+                review = st.data_editor(
+                    imported_orders.style.apply(
+                        lambda column: ["background-color:#f2f4f7;color:#667085" if imported_orders["Ya guardada"].iloc[i] else "background-color:#e0f3e7;color:#176238" for i in range(len(column))],
+                        subset=["Producto en pedido", "Código SKU"],
+                    ),
+                    width="stretch", hide_index=True, num_rows="fixed", key="fill_rate_order_review",
+                    disabled=["Cliente", "Orden", "Fecha pedido", "Fecha inicio", "Fecha límite", "Producto en pedido", "Referencia cliente", "Cajas", "Unidades por caja", "Archivo", "Revisión", "Ya guardada"],
+                    column_config={
+                        "Fecha pedido": st.column_config.DateColumn(format="DD/MM/YYYY"), "Fecha inicio": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                        "Fecha límite": st.column_config.DateColumn(format="DD/MM/YYYY"), "Unidades pedidas": st.column_config.NumberColumn(format="%,.0f"),
+                        "Código SKU": st.column_config.TextColumn(help="Código interno de 8 dígitos"),
+                    },
+                )
+                candidate = review.loc[~review["Ya guardada"]].drop(columns=["Ya guardada"]).copy()
+                candidate["Código SKU"] = candidate["Código SKU"].map(norm_code)
+                invalid = candidate["Código SKU"].isna() | (pd.to_numeric(candidate["Unidades pedidas"], errors="coerce") <= 0)
+                if repeated_files:
+                    st.info(f"{repeated_files} líneas pertenecen a órdenes ya guardadas y se ignorarán.")
+                if invalid.any():
+                    st.error(f"Corrija {int(invalid.sum())} líneas con SKU o cantidad inválidos antes de guardar.")
+                elif candidate.empty:
+                    st.success("Todas estas órdenes ya estaban guardadas. No se agregó ningún duplicado.")
+                elif st.button("Guardar órdenes sin duplicar", type="primary", key="save_fill_rate_orders"):
+                    line_key = ["Cliente", "Orden", "Código SKU", "Referencia cliente", "Unidades pedidas"]
+                    candidate = candidate.drop_duplicates(line_key, keep="first")
+                    combined_orders = pd.concat([orders_df, candidate], ignore_index=True)
+                    combined_orders = combined_orders.drop_duplicates(line_key, keep="first")
+                    st.session_state.active_bundle["orders"] = combined_orders
+                    st.session_state.storage_command = {"action": "save", "revision": uuid.uuid4().hex, "payload": pack_bundle(st.session_state.active_bundle)}
+                    st.session_state.storage_notice = f"Se guardaron {candidate['Orden'].nunique()} órdenes nuevas sin duplicar las existentes."
+                    st.rerun()
+        except Exception as exc:
+            st.error(f"No pude leer las órdenes de compra: {exc}")
+
+    if orders_df.empty:
+        st.info("Cargue las órdenes de compra para comenzar la conciliación.")
+    else:
+        order_summary, fill_detail = reconcile_fill_rate(orders_df, invoice_df, pd.Timestamp.today())
+        expired = order_summary[order_summary["Estado_plazo"] == "Vencida"]
+        active_orders = order_summary[order_summary["Estado_plazo"] == "En plazo"]
+        final_rate = expired["Facturadas"].sum() / expired["Pedidas"].sum() if expired["Pedidas"].sum() else 0
+        provisional_rate = active_orders["Facturadas"].sum() / active_orders["Pedidas"].sum() if active_orders["Pedidas"].sum() else 0
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Fill Rate vencido", f"{final_rate:.1%}")
+        f2.metric("Fill Rate en plazo", f"{provisional_rate:.1%}", help="Es provisional: estas órdenes todavía pueden entregarse")
+        f3.metric("Órdenes guardadas", f"{order_summary['Orden'].nunique():,.0f}")
+        f4.metric("Unidades pendientes", f"{order_summary['Pendientes'].sum():,.0f}")
+
+        status_filter = st.multiselect("Mostrar", ["En plazo", "Completa", "Incumplida", "Revisar"], default=["En plazo", "Incumplida"])
+        client_filter = st.multiselect("Cliente", sorted(order_summary["Cliente"].dropna().unique()), default=[])
+        shown_orders = order_summary[order_summary["Resultado"].isin(status_filter)].copy()
+        if client_filter:
+            shown_orders = shown_orders[shown_orders["Cliente"].isin(client_filter)]
+        shown_orders["Fill Rate"] = shown_orders["Fill_rate"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
+        st.dataframe(
+            shown_orders.rename(columns={"Fecha_limite":"Fecha límite", "Estado_plazo":"Plazo"})[["Cliente", "Orden", "Fecha límite", "Resultado", "Pedidas", "Facturadas", "Pendientes", "Fill Rate", "Productos"]],
+            width="stretch", hide_index=True,
+            column_config={"Fecha límite": st.column_config.DateColumn(format="DD/MM/YYYY"), "Pedidas": st.column_config.NumberColumn(format="%,.0f"), "Facturadas": st.column_config.NumberColumn(format="%,.0f"), "Pendientes": st.column_config.NumberColumn(format="%,.0f")},
+        )
+
+        if not shown_orders.empty:
+            selected_order = st.selectbox("Ver conciliación producto por producto", shown_orders["Orden"].drop_duplicates().tolist())
+            detail = fill_detail[fill_detail["Orden"] == selected_order].copy()
+            detail["Fill Rate"] = detail["Fill_rate"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
+            st.dataframe(
+                detail.rename(columns={"Código SKU":"Código", "Unidades_pedidas":"Pedido", "Unidades_facturadas":"Facturado", "Ultima_factura":"Última factura"})[["Código", "Producto", "Pedido", "Facturado", "Pendiente", "Fill Rate", "Resultado", "Última factura"]],
+                width="stretch", hide_index=True,
+                column_config={"Código": st.column_config.TextColumn(), "Pedido": st.column_config.NumberColumn(format="%,.0f"), "Facturado": st.column_config.NumberColumn(format="%,.0f"), "Pendiente": st.column_config.NumberColumn(format="%,.0f"), "Última factura": st.column_config.DateColumn(format="DD/MM/YYYY")},
+            )
+
+        invoice_orders = set(invoice_df.get("purchase_order", pd.Series(dtype=str)).map(canonical_order)) - {""}
+        saved_orders = set(orders_df["Orden"].map(canonical_order))
+        unmatched = invoice_orders - saved_orders
+        if unmatched:
+            st.caption(f"Hay {len(unmatched)} órdenes mencionadas en facturas que todavía no están cargadas en esta pestaña.")
 
 st.caption("Regla: el stock usa Cantidad disponible. Va lento si el avance está más de 10 puntos por debajo del tiempo transcurrido; va más rápido si está más de 10 puntos por encima.")
