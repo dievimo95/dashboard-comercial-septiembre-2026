@@ -1030,9 +1030,20 @@ with tab7:
                 existing_ids = set(zip(orders_df.get("Cliente", []), orders_df.get("Orden", []).map(canonical_order) if not orders_df.empty else []))
                 imported_orders["Ya guardada"] = imported_orders.apply(lambda row: (row["Cliente"], row["Orden"]) in existing_ids, axis=1)
                 repeated_files = int(imported_orders["Ya guardada"].sum())
+                # A Styler keeps showing the values parsed from the PDF unless we
+                # reapply the data-editor changes before validating and coloring.
+                review_edits = st.session_state.get("fill_rate_order_review", {}).get("edited_rows", {})
+                for row_index, changes in review_edits.items():
+                    position = int(row_index)
+                    if position >= len(imported_orders):
+                        continue
+                    for editable_column in ["Código SKU", "Unidades pedidas"]:
+                        if editable_column in changes:
+                            imported_orders.at[imported_orders.index[position], editable_column] = changes[editable_column]
                 visible_codes = imported_orders["Código SKU"].fillna("").astype(str).str.strip()
                 visible_quantities = pd.to_numeric(imported_orders["Unidades pedidas"], errors="coerce")
                 visible_invalid = ~visible_codes.str.fullmatch(r"\d{8}") | visible_quantities.isna() | (visible_quantities <= 0)
+                imported_orders.loc[~visible_invalid & imported_orders["Revisión"].str.contains("no identificado", case=False, na=False), "Revisión"] = "SKU corregido manualmente"
 
                 def color_order_row(row):
                     if visible_invalid.iloc[row.name]:
@@ -1051,6 +1062,15 @@ with tab7:
                         "Código SKU": st.column_config.TextColumn(help="Código interno de 8 dígitos"),
                     },
                 )
+                # Use the edited cells explicitly as the source of truth. This
+                # avoids a one-refresh delay when Streamlit receives the edit.
+                for row_index, changes in st.session_state.get("fill_rate_order_review", {}).get("edited_rows", {}).items():
+                    position = int(row_index)
+                    if position >= len(review):
+                        continue
+                    for editable_column in ["Código SKU", "Unidades pedidas"]:
+                        if editable_column in changes:
+                            review.at[review.index[position], editable_column] = changes[editable_column]
                 candidate = review.loc[~review["Ya guardada"]].drop(columns=["Ya guardada"]).copy()
                 candidate["Código SKU"] = candidate["Código SKU"].map(norm_code)
                 invalid = candidate["Código SKU"].isna() | (pd.to_numeric(candidate["Unidades pedidas"], errors="coerce") <= 0)
