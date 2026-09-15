@@ -1030,11 +1030,19 @@ with tab7:
                 existing_ids = set(zip(orders_df.get("Cliente", []), orders_df.get("Orden", []).map(canonical_order) if not orders_df.empty else []))
                 imported_orders["Ya guardada"] = imported_orders.apply(lambda row: (row["Cliente"], row["Orden"]) in existing_ids, axis=1)
                 repeated_files = int(imported_orders["Ya guardada"].sum())
+                visible_codes = imported_orders["Código SKU"].fillna("").astype(str).str.strip()
+                visible_quantities = pd.to_numeric(imported_orders["Unidades pedidas"], errors="coerce")
+                visible_invalid = ~visible_codes.str.fullmatch(r"\d{8}") | visible_quantities.isna() | (visible_quantities <= 0)
+
+                def color_order_row(row):
+                    if visible_invalid.iloc[row.name]:
+                        return ["background-color:#ffe1e1;color:#9b1c1c;font-weight:700"] * len(row)
+                    if row["Ya guardada"]:
+                        return ["background-color:#f2f4f7;color:#667085"] * len(row)
+                    return ["background-color:#e0f3e7;color:#176238"] * len(row)
+
                 review = st.data_editor(
-                    imported_orders.style.apply(
-                        lambda column: ["background-color:#f2f4f7;color:#667085" if imported_orders["Ya guardada"].iloc[i] else "background-color:#e0f3e7;color:#176238" for i in range(len(column))],
-                        subset=["Producto en pedido", "Código SKU"],
-                    ),
+                    imported_orders.style.apply(color_order_row, axis=1),
                     width="stretch", hide_index=True, num_rows="fixed", key="fill_rate_order_review",
                     disabled=["Cliente", "Orden", "Fecha pedido", "Fecha inicio", "Fecha límite", "Producto en pedido", "Referencia cliente", "Cajas", "Unidades por caja", "Archivo", "Revisión", "Ya guardada"],
                     column_config={
