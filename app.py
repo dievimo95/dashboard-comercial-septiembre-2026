@@ -149,6 +149,7 @@ def blank_bundle():
         "stock": pd.DataFrame(columns=["code", "product", "available", "quantity", "expiry"]),
         "lots": pd.DataFrame(columns=["code", "product", "location", "lot", "available", "quantity", "expiry", "uom", "company"]),
         "invoices": pd.DataFrame(columns=["invoice", "date", "week", "customer", "code", "quantity", "unit_price", "net_sales", "pdf_page"]),
+        "weekly_order": pd.DataFrame(columns=["code", "ordered"]),
         "cutoff": pd.NaT,
     }
 
@@ -156,7 +157,7 @@ def blank_bundle():
 def pack_bundle(bundle):
     data = {
         "version": 1,
-        "tables": {name: bundle[name].to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices"]},
+        "tables": {name: bundle.get(name, blank_bundle()[name]).to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices", "weekly_order"]},
         "cutoff": None if pd.isna(bundle["cutoff"]) else pd.Timestamp(bundle["cutoff"]).isoformat(),
     }
     return base64.b64encode(zlib.compress(json.dumps(data).encode("utf-8"), level=9)).decode("ascii")
@@ -173,8 +174,9 @@ def unpack_bundle(encoded):
     if data.get("version") != 1:
         raise ValueError("Versión de copia no compatible")
     bundle = blank_bundle()
-    for name in ["forecast", "stock", "lots", "invoices"]:
-        bundle[name] = pd.read_json(io.StringIO(data["tables"][name]), orient="records", dtype={"code": str}, convert_dates=False)
+    for name in ["forecast", "stock", "lots", "invoices", "weekly_order"]:
+        if name in data["tables"]:
+            bundle[name] = pd.read_json(io.StringIO(data["tables"][name]), orient="records", dtype={"code": str}, convert_dates=False)
     for name, column in [("stock", "expiry"), ("lots", "expiry"), ("invoices", "date")]:
         if column in bundle[name]:
             bundle[name][column] = pd.to_datetime(bundle[name][column], errors="coerce")
@@ -477,6 +479,8 @@ if st.session_state.get("app_data_version") != APP_DATA_VERSION:
         st.session_state.pop(stale_key, None)
 if "upload_generation" not in st.session_state:
     st.session_state.upload_generation = 0
+if "current_weekly_order" not in st.session_state:
+    st.session_state.current_weekly_order = st.session_state.active_bundle.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy()
 if "storage_command" not in st.session_state:
     st.session_state.storage_command = {"action": "load", "revision": "initial", "payload": ""}
 command = st.session_state.storage_command
@@ -487,6 +491,7 @@ if isinstance(storage_result, dict):
         if storage_result.get("payload"):
             try:
                 st.session_state.active_bundle = unpack_bundle(storage_result["payload"])
+                st.session_state.current_weekly_order = st.session_state.active_bundle.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy()
                 st.session_state.storage_notice = "Se recuperó el último corte guardado en este navegador."
             except Exception as exc:
                 st.session_state.storage_notice = f"No pude recuperar la copia del navegador: {exc}"
@@ -517,6 +522,8 @@ with st.sidebar:
         confirm_col, cancel_col = st.columns(2)
         if confirm_col.button("Sí, dejar en blanco", type="primary", use_container_width=True):
             st.session_state.active_bundle = blank_bundle()
+            st.session_state.current_weekly_order = pd.DataFrame(columns=["code", "ordered"])
+            st.session_state.pop("current_weekly_order_signature", None)
             st.session_state.storage_loaded = True
             st.session_state.storage_command = {"action": "clear", "revision": uuid.uuid4().hex, "payload": ""}
             st.session_state.upload_generation += 1
@@ -565,7 +572,7 @@ with st.sidebar:
                 "cutoff": cutoff_candidate,
             }
             if not errors:
-                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "cutoff": cutoff_candidate}
+                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "weekly_order": active.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy(), "cutoff": cutoff_candidate}
         except Exception as exc:
             st.session_state.validated_signature = signature
             st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "new_lines": 0, "new_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None, "cutoff": None}
@@ -670,13 +677,25 @@ with tab2:
 with tab3:
     search = st.text_input("Buscar código o producto")
     full = analysis.copy()
+    upcoming_order = st.session_state.current_weekly_order
+    if not upcoming_order.empty:
+        full = full.merge(upcoming_order.rename(columns={"ordered": "upcoming_order"}), on="code", how="left")
+    else:
+        full["upcoming_order"] = 0
+    full["upcoming_order"] = pd.to_numeric(full["upcoming_order"], errors="coerce").fillna(0)
+    full["forecast_after_upcoming"] = full["forecast"].fillna(0) - full["sold"] - full["upcoming_order"]
     if search:
         full = full[full["code"].str.contains(search, case=False, na=False) | full["product"].str.contains(search, case=False, na=False)]
     full["Avance"] = full["advance"].map(
         lambda value: "—" if pd.isna(value) else f"{value:.1%}".replace(".", ",").replace("%", " %")
     )
-    show = full[["code", "product", "forecast", "sold", "Avance", "available", "remaining", "projection", "status", "action"]].rename(columns={"code":"Código", "product":"Producto", "forecast":"Forecast", "sold":"Vendido", "available":"Stock", "remaining":"Falta vender", "projection":"Proyección", "status":"Estado", "action":"Qué hacer"})
-    st.dataframe(show, width="stretch", hide_index=True, column_config={"Código": st.column_config.TextColumn(), "Avance": st.column_config.TextColumn(width="small"), "Forecast": st.column_config.NumberColumn(format="%,.0f"), "Vendido": st.column_config.NumberColumn(format="%,.0f"), "Stock": st.column_config.NumberColumn(format="%,.0f"), "Falta vender": st.column_config.NumberColumn(format="%,.0f"), "Proyección": st.column_config.NumberColumn(format="%,.0f")})
+    show = full[["code", "product", "forecast", "sold", "upcoming_order", "forecast_after_upcoming", "Avance", "available", "status", "action"]].rename(columns={"code":"Código", "product":"Producto", "forecast":"Forecast", "sold":"Facturado", "upcoming_order":"Pedido por venir", "forecast_after_upcoming":"Saldo tras pedido", "available":"Stock", "status":"Estado", "action":"Qué hacer"})
+    styled_show = show.style.apply(
+        lambda column: ["background-color: #e8f3ff; color: #174f7a; font-weight: 700" if show["Pedido por venir"].iloc[position] > 0 else "" for position in range(len(column))],
+        subset=["Pedido por venir", "Saldo tras pedido"],
+    )
+    st.caption("Pedido por venir = pedidos cargados y confirmados en la pestaña Pedido semanal. Saldo tras pedido = forecast − facturado − pedido.")
+    st.dataframe(styled_show, width="stretch", hide_index=True, column_config={"Código": st.column_config.TextColumn(), "Producto": st.column_config.TextColumn(width="large"), "Avance": st.column_config.TextColumn(width="small"), "Forecast": st.column_config.NumberColumn(format="%,.0f"), "Facturado": st.column_config.NumberColumn(format="%,.0f"), "Pedido por venir": st.column_config.NumberColumn(format="%,.0f"), "Saldo tras pedido": st.column_config.NumberColumn(format="%,.0f"), "Stock": st.column_config.NumberColumn(format="%,.0f")})
 
 with tab4:
     weekly = invoice_df.groupby("week", as_index=False).agg(Unidades=("quantity", "sum"), Venta_neta=("net_sales", "sum"))
@@ -835,6 +854,13 @@ with tab6:
         weekly_order = prepare_weekly_order(typed_order, "Código", "Cantidad")
 
     if not weekly_order.empty:
+        order_signature = tuple(map(tuple, weekly_order[["code", "ordered"]].sort_values("code").to_numpy()))
+        if st.session_state.get("current_weekly_order_signature") != order_signature:
+            st.session_state.current_weekly_order = weekly_order[["code", "ordered"]].copy()
+            st.session_state.current_weekly_order_signature = order_signature
+            st.session_state.active_bundle["weekly_order"] = st.session_state.current_weekly_order.copy()
+            st.session_state.storage_command = {"action": "save", "revision": uuid.uuid4().hex, "payload": pack_bundle(st.session_state.active_bundle)}
+            st.rerun()
         order_analysis = analyze_weekly_order(weekly_order, forecast_df, stock_df, invoice_df)
         total_ordered = order_analysis["ordered"].sum()
         total_fitting = order_analysis["fits_forecast"].sum()
