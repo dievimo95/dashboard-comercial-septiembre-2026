@@ -1029,6 +1029,7 @@ with tab7:
                 imported_orders["Orden"] = imported_orders["Orden"].map(canonical_order)
                 existing_ids = set(zip(orders_df.get("Cliente", []), orders_df.get("Orden", []).map(canonical_order) if not orders_df.empty else []))
                 imported_orders["Ya guardada"] = imported_orders.apply(lambda row: (row["Cliente"], row["Orden"]) in existing_ids, axis=1)
+                imported_orders["Excluir"] = False
                 repeated_files = int(imported_orders["Ya guardada"].sum())
                 # A Styler keeps showing the values parsed from the PDF unless we
                 # reapply the data-editor changes before validating and coloring.
@@ -1037,7 +1038,7 @@ with tab7:
                     position = int(row_index)
                     if position >= len(imported_orders):
                         continue
-                    for editable_column in ["Código SKU", "Unidades pedidas"]:
+                    for editable_column in ["Código SKU", "Unidades pedidas", "Excluir"]:
                         if editable_column in changes:
                             imported_orders.at[imported_orders.index[position], editable_column] = changes[editable_column]
                 visible_codes = imported_orders["Código SKU"].fillna("").astype(str).str.strip()
@@ -1046,6 +1047,8 @@ with tab7:
                 imported_orders.loc[~visible_invalid & imported_orders["Revisión"].str.contains("no identificado", case=False, na=False), "Revisión"] = "SKU corregido manualmente"
 
                 def color_order_row(row):
+                    if bool(row["Excluir"]):
+                        return ["background-color:#eef0f3;color:#667085;text-decoration:line-through"] * len(row)
                     if visible_invalid.iloc[row.name]:
                         return ["background-color:#ffe1e1;color:#9b1c1c;font-weight:700"] * len(row)
                     if row["Ya guardada"]:
@@ -1060,6 +1063,7 @@ with tab7:
                         "Fecha pedido": st.column_config.DateColumn(format="DD/MM/YYYY"), "Fecha inicio": st.column_config.DateColumn(format="DD/MM/YYYY"),
                         "Fecha límite": st.column_config.DateColumn(format="DD/MM/YYYY"), "Unidades pedidas": st.column_config.NumberColumn(format="%,.0f"),
                         "Código SKU": st.column_config.TextColumn(help="Código interno de 8 dígitos"),
+                        "Excluir": st.column_config.CheckboxColumn(help="Marque esta casilla si el producto todavía no está creado y no debe entrar al Fill Rate"),
                     },
                 )
                 # Use the edited cells explicitly as the source of truth. This
@@ -1068,18 +1072,21 @@ with tab7:
                     position = int(row_index)
                     if position >= len(review):
                         continue
-                    for editable_column in ["Código SKU", "Unidades pedidas"]:
+                    for editable_column in ["Código SKU", "Unidades pedidas", "Excluir"]:
                         if editable_column in changes:
                             review.at[review.index[position], editable_column] = changes[editable_column]
-                candidate = review.loc[~review["Ya guardada"]].drop(columns=["Ya guardada"]).copy()
+                excluded_count = int(review["Excluir"].fillna(False).astype(bool).sum())
+                candidate = review.loc[~review["Ya guardada"] & ~review["Excluir"].fillna(False).astype(bool)].drop(columns=["Ya guardada", "Excluir"]).copy()
                 candidate["Código SKU"] = candidate["Código SKU"].map(norm_code)
                 invalid = candidate["Código SKU"].isna() | (pd.to_numeric(candidate["Unidades pedidas"], errors="coerce") <= 0)
                 if repeated_files:
                     st.info(f"{repeated_files} líneas pertenecen a órdenes ya guardadas y se ignorarán.")
+                if excluded_count:
+                    st.info(f"{excluded_count} líneas fueron excluidas y no entrarán al Fill Rate.")
                 if invalid.any():
                     st.error(f"Corrija {int(invalid.sum())} líneas con SKU o cantidad inválidos antes de guardar.")
                 elif candidate.empty:
-                    st.success("Todas estas órdenes ya estaban guardadas. No se agregó ningún duplicado.")
+                    st.success("No hay líneas nuevas para guardar: ya estaban guardadas o fueron excluidas.")
                 elif st.button("Guardar órdenes sin duplicar", type="primary", key="save_fill_rate_orders"):
                     line_key = ["Cliente", "Orden", "Código SKU", "Referencia cliente", "Unidades pedidas"]
                     candidate = candidate.drop_duplicates(line_key, keep="first")
