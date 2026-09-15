@@ -162,6 +162,7 @@ def blank_bundle():
         "stock": pd.DataFrame(columns=["code", "product", "available", "quantity", "expiry"]),
         "lots": pd.DataFrame(columns=["code", "product", "location", "lot", "available", "quantity", "expiry", "uom", "company"]),
         "invoices": pd.DataFrame(columns=["invoice", "date", "week", "customer", "code", "quantity", "unit_price", "net_sales", "pdf_page", "purchase_order"]),
+        "fill_rate_invoices": pd.DataFrame(columns=["invoice", "date", "week", "customer", "code", "quantity", "unit_price", "net_sales", "pdf_page", "purchase_order"]),
         "orders": pd.DataFrame(columns=["Cliente", "Orden", "Fecha pedido", "Fecha inicio", "Fecha límite", "Producto en pedido", "Referencia cliente", "Cajas", "Unidades por caja", "Unidades pedidas", "Código SKU", "Archivo", "Revisión"]),
         "weekly_order": pd.DataFrame(columns=["code", "ordered"]),
         "cutoff": pd.NaT,
@@ -170,8 +171,8 @@ def blank_bundle():
 
 def pack_bundle(bundle):
     data = {
-        "version": 2,
-        "tables": {name: bundle.get(name, blank_bundle()[name]).to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices", "orders", "weekly_order"]},
+        "version": 3,
+        "tables": {name: bundle.get(name, blank_bundle()[name]).to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices", "fill_rate_invoices", "orders", "weekly_order"]},
         "cutoff": None if pd.isna(bundle["cutoff"]) else pd.Timestamp(bundle["cutoff"]).isoformat(),
     }
     return base64.b64encode(zlib.compress(json.dumps(data).encode("utf-8"), level=9)).decode("ascii")
@@ -185,13 +186,13 @@ def unpack_bundle(encoded):
     if len(raw) > 30_000_000 or inflater.unconsumed_tail or not inflater.eof:
         raise ValueError("Copia guardada demasiado grande o dañada")
     data = json.loads(raw)
-    if data.get("version") not in [1, 2]:
+    if data.get("version") not in [1, 2, 3]:
         raise ValueError("Versión de copia no compatible")
     bundle = blank_bundle()
-    for name in ["forecast", "stock", "lots", "invoices", "orders", "weekly_order"]:
+    for name in ["forecast", "stock", "lots", "invoices", "fill_rate_invoices", "orders", "weekly_order"]:
         if name in data["tables"]:
             bundle[name] = pd.read_json(io.StringIO(data["tables"][name]), orient="records", dtype={"code": str}, convert_dates=False)
-    for name, column in [("stock", "expiry"), ("lots", "expiry"), ("invoices", "date"), ("orders", "Fecha pedido"), ("orders", "Fecha inicio"), ("orders", "Fecha límite")]:
+    for name, column in [("stock", "expiry"), ("lots", "expiry"), ("invoices", "date"), ("fill_rate_invoices", "date"), ("orders", "Fecha pedido"), ("orders", "Fecha inicio"), ("orders", "Fecha límite")]:
         if column in bundle[name]:
             bundle[name][column] = pd.to_datetime(bundle[name][column], errors="coerce")
     bundle["cutoff"] = pd.to_datetime(data["cutoff"]) if data.get("cutoff") else pd.NaT
@@ -655,7 +656,7 @@ with st.sidebar:
                 "cutoff": cutoff_candidate,
             }
             if not errors:
-                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "orders": active.get("orders", blank_bundle()["orders"]).copy(), "weekly_order": active.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy(), "cutoff": cutoff_candidate}
+                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "fill_rate_invoices": active.get("fill_rate_invoices", blank_bundle()["fill_rate_invoices"]).copy(), "orders": active.get("orders", blank_bundle()["orders"]).copy(), "weekly_order": active.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy(), "cutoff": cutoff_candidate}
         except Exception as exc:
             st.session_state.validated_signature = signature
             st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "new_lines": 0, "new_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None, "cutoff": None}
@@ -696,6 +697,7 @@ forecast_df = active["forecast"]
 stock_df = active["stock"]
 lots_df = active["lots"]
 invoice_df = active["invoices"]
+fill_rate_invoice_df = active.get("fill_rate_invoices", blank_bundle()["fill_rate_invoices"])
 orders_df = active.get("orders", blank_bundle()["orders"])
 
 if forecast_df.empty or stock_df.empty or invoice_df.empty:
@@ -1016,9 +1018,41 @@ with tab7:
     st.subheader("Fill Rate: ¿cuánto entregamos de cada orden?")
     st.caption("La factura se concilia por número de orden de compra + SKU. Las órdenes que todavía no vencen se muestran 'En plazo' y no cuentan como incumplimiento.")
 
+    st.markdown("#### 1. Facturas para conciliar")
+    st.caption("Estas facturas se guardan únicamente para el Fill Rate. No cambian las ventas, el forecast ni el stock de las otras pestañas.")
+    fill_rate_pdf = st.file_uploader("Cargar facturas del mes (.pdf)", type="pdf", key="fill_rate_invoice_pdf")
+    if fill_rate_pdf is not None:
+        try:
+            parsed_fill_invoices = read_pdf(fill_rate_pdf)
+            if parsed_fill_invoices.empty:
+                st.error("No pude leer líneas de producto en este PDF de facturas.")
+            else:
+                orders_read = int(parsed_fill_invoices.loc[parsed_fill_invoices["purchase_order"].ne(""), "invoice"].nunique())
+                st.write(f"Se leyeron **{parsed_fill_invoices['invoice'].nunique()} facturas**, **{len(parsed_fill_invoices)} líneas** y **{orders_read} facturas con orden de compra**.")
+                if st.button("Guardar facturas y conciliar", type="primary", key="save_fill_rate_invoices"):
+                    combined_fill_invoices = pd.concat([parsed_fill_invoices, fill_rate_invoice_df], ignore_index=True)
+                    fill_key = ["invoice", "date", "code", "quantity", "net_sales"]
+                    duplicate_fill_lines = int(combined_fill_invoices.duplicated(fill_key).sum())
+                    combined_fill_invoices = combined_fill_invoices.drop_duplicates(fill_key, keep="first")
+                    st.session_state.active_bundle["fill_rate_invoices"] = combined_fill_invoices
+                    st.session_state.storage_command = {"action": "save", "revision": uuid.uuid4().hex, "payload": pack_bundle(st.session_state.active_bundle)}
+                    st.session_state.storage_notice = f"Facturas guardadas para Fill Rate. Se ignoraron {duplicate_fill_lines} líneas repetidas."
+                    st.rerun()
+        except Exception as exc:
+            st.error(f"No pude leer las facturas para Fill Rate: {exc}")
+
+    if not fill_rate_invoice_df.empty:
+        saved_invoice_count = fill_rate_invoice_df["invoice"].nunique()
+        saved_order_count = fill_rate_invoice_df.loc[fill_rate_invoice_df.get("purchase_order", "").ne(""), "invoice"].nunique() if "purchase_order" in fill_rate_invoice_df else 0
+        st.success(f"Hay {saved_invoice_count} facturas guardadas para conciliar; {saved_order_count} incluyen número de orden de compra.")
+    else:
+        st.info("Todavía no hay facturas guardadas específicamente para el Fill Rate.")
+
+    st.markdown("#### 2. Órdenes de compra")
     historical_order_files = st.file_uploader(
         "Agregar órdenes de compra (.pdf)", type="pdf", accept_multiple_files=True, key="fill_rate_order_pdfs"
     )
+    st.caption("En este segundo cargador coloque solamente pedidos. Si aparece Facturas (41).pdf aquí, quítelo con la X.")
     if historical_order_files:
         try:
             imported_orders, import_errors = parse_order_pdfs(historical_order_files, forecast_df, stock_df)
@@ -1104,7 +1138,8 @@ with tab7:
     if orders_df.empty:
         st.info("Cargue las órdenes de compra para comenzar la conciliación.")
     else:
-        order_summary, fill_detail = reconcile_fill_rate(orders_df, invoice_df, pd.Timestamp.today())
+        invoices_for_fill_rate = fill_rate_invoice_df if not fill_rate_invoice_df.empty else invoice_df
+        order_summary, fill_detail = reconcile_fill_rate(orders_df, invoices_for_fill_rate, pd.Timestamp.today())
         expired = order_summary[order_summary["Estado_plazo"] == "Vencida"]
         active_orders = order_summary[order_summary["Estado_plazo"] == "En plazo"]
         final_rate = expired["Facturadas"].sum() / expired["Pedidas"].sum() if expired["Pedidas"].sum() else 0
