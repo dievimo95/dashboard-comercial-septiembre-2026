@@ -1,0 +1,35 @@
+name: Add Coral photo order reader
+
+on:
+  push:
+    paths:
+      - '.github/workflows/add-coral-photo-orders.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Apply Coral photo patch
+        run: python .github/scripts/add_coral_photo_orders.py
+
+      - name: Validate Python syntax
+        run: python -m py_compile app.py
+
+      - name: Commit application change
+        shell: bash
+        run: |
+          if git diff --quiet -- app.py; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py
+          git commit -m "feat: read Coral weekly orders from photos"
+          git push
