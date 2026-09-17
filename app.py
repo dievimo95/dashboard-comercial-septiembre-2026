@@ -6,11 +6,14 @@ import uuid
 import zlib
 from datetime import datetime
 from pathlib import Path
+from difflib import SequenceMatcher
 
 import pandas as pd
 import pdfplumber
 import plotly.express as px
 import streamlit as st
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+import pytesseract
 import streamlit.components.v1 as components
 
 
@@ -72,8 +75,114 @@ def number_local(value):
 
 
 def canonical_order(value):
-    """Comparable order key while preserving alphanumeric customer orders."""
-    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+    """Comparable order key while preserving alphanumeric customer orders.
+
+    Invoice PDFs sometimes leave extra text after ``OC:``. Prefer the first
+    plausible numeric order number (allowing spaces/hyphens) so an invoice such
+    as ``OC: 100 6243 97153`` matches the order parser's ``100624397153``.
+    """
+    raw = str(value or "").upper().strip()
+    numeric = re.search(r"(?<!\d)((?:\d[ -]*){6,20})(?!\d)", raw)
+    if numeric:
+        digits = re.sub(r"\D", "", numeric.group(1))
+        if len(digits) >= 6:
+            return digits
+    return re.sub(r"[^A-Z0-9]", "", raw)
+
+
+def _normalize_product_text(value):
+    value = str(value or "").upper()
+    value = re.sub(r"[^A-Z0-9ÁÉÍÓÚÑ ]+", " ", value)
+    value = re.sub(r"\bREF\b.*$", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _product_catalog(forecast_df, stock_df):
+    frames = []
+    for source in (forecast_df, stock_df):
+        if source is not None and not source.empty and {"code", "product"}.issubset(source.columns):
+            frames.append(source[["code", "product"]].copy())
+    if not frames:
+        return pd.DataFrame(columns=["code", "product", "product_norm"])
+    catalog = pd.concat(frames, ignore_index=True).dropna(subset=["code", "product"])
+    catalog["code"] = catalog["code"].map(norm_code)
+    catalog = catalog[catalog["code"].notna()].drop_duplicates("code")
+    catalog["product_norm"] = catalog["product"].map(_normalize_product_text)
+    return catalog.reset_index(drop=True)
+
+
+def _best_product_match(name, catalog):
+    target = _normalize_product_text(name)
+    if not target or catalog.empty:
+        return "", "", 0.0
+
+    best_code, best_name, best_score = "", "", 0.0
+    target_tokens = set(target.split())
+    for row in catalog.itertuples(index=False):
+        candidate = row.product_norm
+        seq = SequenceMatcher(None, target, candidate).ratio()
+        cand_tokens = set(candidate.split())
+        overlap = len(target_tokens & cand_tokens) / max(len(target_tokens | cand_tokens), 1)
+        contains = 1.0 if target in candidate or candidate in target else 0.0
+        score = max(seq, (seq * 0.65 + overlap * 0.35), contains)
+        if score > best_score:
+            best_code, best_name, best_score = row.code, row.product, score
+    return best_code, best_name, best_score
+
+
+def read_coral_order_image(file, forecast_df, stock_df):
+    """Read a simple Coral product/quantity table from a photo.
+
+    The source image does not contain a customer SKU, so product descriptions
+    are OCR'd and then matched against the forecast/stock product catalog.
+    Every result remains editable before it is accepted as a weekly order.
+    """
+    image = Image.open(file).convert("L")
+    image = ImageOps.autocontrast(image)
+    image = image.resize((image.width * 2, image.height * 2))
+    image = ImageEnhance.Contrast(image).enhance(1.7)
+    image = image.filter(ImageFilter.SHARPEN)
+
+    try:
+        ocr = pytesseract.image_to_string(image, config="--psm 6")
+    except Exception as exc:
+        raise RuntimeError(f"No pude ejecutar OCR sobre la imagen: {exc}") from exc
+
+    rows = []
+    for raw in ocr.splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if not line or "PRODUCTO" in line.upper() or "CANTIDAD" in line.upper():
+            continue
+        match = re.match(r"^(.*?)[\s|]+(\d{1,5})\s*$", line)
+        if not match:
+            continue
+        product = match.group(1).strip(" |:-")
+        qty = int(match.group(2))
+        if not product or qty <= 0:
+            continue
+        rows.append((product, qty))
+
+    if not rows:
+        raise ValueError("No pude identificar filas PRODUCTO / CANTIDAD en la imagen. Pruebe con una foto más recta y nítida.")
+
+    catalog = _product_catalog(forecast_df, stock_df)
+    parsed = []
+    for product, qty in rows:
+        code, matched_name, score = _best_product_match(product, catalog)
+        parsed.append({
+            "Cliente": "Coral",
+            "Producto leído": product,
+            "Producto identificado": matched_name,
+            "Cantidad": qty,
+            "Código SKU": code if score >= 0.58 else "",
+            "Coincidencia": score,
+            "Revisión": "SKU identificado" if score >= 0.58 else "Revisar SKU",
+        })
+
+    result = pd.DataFrame(parsed)
+    result = result.drop_duplicates(["Producto leído", "Cantidad"], keep="first")
+    return result, ocr
 
 
 def read_forecast(file):
@@ -108,7 +217,13 @@ def read_pdf(file):
     auth_date_re = re.compile(r"(?:N[uú]mero de autorizaci[oó]n:|Authorization No\.:)\s*\n?(\d{8})", re.I)
     spanish = re.compile(r"^(\d{8})\s+.*?\s([\d.]+,\d{4})\s+([\d.]+,\d{5})\s+.*?\$\s*([\d.]+,\d{2})$")
     english = re.compile(r"^(\d{8})\s+.*?\s([\d,]+\.\d{4})\s+([\d,]+\.\d{5})\s+.*?\$\s*([\d,]+\.\d{2})$")
-    purchase_order_re = re.compile(r"\bOC\s*:\s*([^\n]+)", re.I)
+    # Capture only the order token after OC instead of the whole remainder
+    # of the line. The previous expression could turn trailing labels/text into
+    # part of the order key and make every Fill Rate match fail silently.
+    purchase_order_re = re.compile(
+        r"\bOC\s*:\s*((?:\d[ -]*){6,20}|[A-Z0-9][A-Z0-9._/-]{4,30})",
+        re.I,
+    )
     records, invoice, date, customer, order_by_invoice = [], None, None, "", {}
     source = io.BytesIO(file.getvalue()) if hasattr(file, "getvalue") else file
     with pdfplumber.open(source) as pdf:
@@ -202,10 +317,14 @@ def unpack_bundle(encoded):
 
 
 def build_analysis(forecast, stock, invoices, cutoff):
-    # Export invoices (001-901) are reported, but they belong to a different
-    # commercial plan and must not consume the domestic monthly forecast.
-    forecast_invoices = invoices[~invoices["invoice"].astype(str).str.startswith("001-901-")].copy()
-    sold = forecast_invoices.groupby("code", as_index=False).agg(sold=("quantity", "sum"), net_sales=("net_sales", "sum"))
+    # Las exportaciones 001-901 se informan por separado, pero pertenecen a
+    # otro plan comercial y no consumen el forecast nacional del mes.
+    forecast_invoices = invoices[
+        ~invoices["invoice"].astype(str).str.startswith("001-901-")
+    ].copy()
+    sold = forecast_invoices.groupby("code", as_index=False).agg(
+        sold=("quantity", "sum"), net_sales=("net_sales", "sum")
+    )
     master = forecast.merge(stock[["code", "available", "quantity", "expiry"]], on="code", how="outer")
     master = master.merge(sold, on="code", how="outer")
     names = pd.concat([
@@ -454,7 +573,7 @@ def analyze_weekly_order(order, forecast, stock, invoices):
     for invoice_type in ["normal", "export", "other"]:
         if invoice_type not in sold:
             sold[invoice_type] = 0
-    # Export remains visible in the detail, but does not reduce forecast.
+    # La exportación sigue visible en el detalle, pero no reduce el forecast.
     sold["sold"] = sold[["normal", "other"]].sum(axis=1)
     names = pd.concat([forecast[["code", "product"]], stock[["code", "product"]]]).drop_duplicates("code")
     result = order.merge(forecast[["code", "forecast"]], on="code", how="left")
@@ -724,12 +843,86 @@ forecast_total = analysis["forecast"].fillna(0).sum()
 
 st.markdown(f'<div class="hero"><h1>Control comercial</h1><p>{source_label}. Vea qué pasa y qué hacer.</p></div>', unsafe_allow_html=True)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Forecast del mes", f"{forecast_total:,.0f}")
-c2.metric("Vendido contra forecast", f"{sold_forecast:,.0f}", help="No incluye facturas de exportación 001-901")
-c3.metric("Avance", f"{sold_forecast / forecast_total:.1%}", f"{sold_forecast / forecast_total - elapsed:+.1%} frente al tiempo")
-c4.metric("Stock disponible", f"{analysis['available'].sum():,.0f}")
+# KPIs ejecutivos del resumen: venta, forecast asegurado y riesgo de inventario.
+summary_analysis = analysis.copy()
+summary_weekly_order = st.session_state.get(
+    "current_weekly_order",
+    pd.DataFrame(columns=["code", "ordered"]),
+)
+if not summary_weekly_order.empty:
+    summary_analysis = summary_analysis.merge(
+        summary_weekly_order.rename(columns={"ordered": "upcoming_order"}),
+        on="code",
+        how="left",
+    )
+else:
+    summary_analysis["upcoming_order"] = 0
 
+summary_analysis["upcoming_order"] = pd.to_numeric(
+    summary_analysis["upcoming_order"], errors="coerce"
+).fillna(0)
+summary_analysis["available"] = pd.to_numeric(
+    summary_analysis["available"], errors="coerce"
+).fillna(0)
+summary_analysis["sold"] = pd.to_numeric(
+    summary_analysis["sold"], errors="coerce"
+).fillna(0)
+summary_analysis["forecast"] = pd.to_numeric(
+    summary_analysis["forecast"], errors="coerce"
+)
+
+forecast_rows = summary_analysis[summary_analysis["forecast"].notna()].copy()
+forecast_rows["secured_units"] = (
+    forecast_rows["sold"] + forecast_rows["upcoming_order"]
+).clip(lower=0)
+forecast_rows["secured_units"] = forecast_rows[
+    ["secured_units", "forecast"]
+].min(axis=1)
+forecast_secured_rate = (
+    forecast_rows["secured_units"].sum() / forecast_total
+    if forecast_total else 0
+)
+
+summary_analysis["confirmed_uncovered"] = (
+    summary_analysis["upcoming_order"] - summary_analysis["available"]
+).clip(lower=0)
+summary_analysis["summary_critical"] = (
+    summary_analysis["confirmed_uncovered"].gt(0)
+    | (
+        summary_analysis["available"].le(0)
+        & summary_analysis["remaining"].gt(0)
+    )
+)
+summary_critical_skus = int(summary_analysis["summary_critical"].sum())
+summary_missing_units = float(summary_analysis["missing_stock"].sum())
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("Forecast del mes", f"{forecast_total:,.0f} un.")
+c2.metric(
+    "Facturado contra forecast",
+    f"{sold_forecast:,.0f} un.",
+    help="No incluye facturas de exportación 001-901.",
+)
+c3.metric(
+    "Avance",
+    f"{sold_forecast / forecast_total:.1%}" if forecast_total else "0,0%",
+    f"{sold_forecast / forecast_total - elapsed:+.1%} vs. tiempo" if forecast_total else None,
+)
+c4.metric(
+    "Forecast asegurado",
+    f"{forecast_secured_rate:.1%}",
+    help="Porcentaje del forecast ya cubierto por facturación + pedidos confirmados, limitado al forecast de cada SKU.",
+)
+c5.metric(
+    "🔴 SKU críticos",
+    f"{summary_critical_skus:,}",
+    help="SKU con pedido confirmado sin cobertura suficiente o sin stock mientras aún falta forecast por vender.",
+)
+c6.metric(
+    "⚠️ Faltante de stock",
+    f"{summary_missing_units:,.0f} un.",
+    help="Unidades adicionales requeridas para tener capacidad de cumplir el forecast pendiente.",
+)
 if sold_forecast / forecast_total > elapsed:
     st.success(f"En general vamos adelantados: se vendió {sold_forecast / forecast_total:.1%} del forecast y ha pasado {elapsed:.1%} del mes.")
 else:
@@ -740,29 +933,345 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["Resumen", "Qué hacer", "To
 with tab1:
     left, right = st.columns([1, 1])
     with left:
-        progress = pd.DataFrame({"Indicador": ["Mes transcurrido", "Forecast vendido"], "Porcentaje": [elapsed, sold_forecast / forecast_total]})
-        fig = px.bar(progress, x="Indicador", y="Porcentaje", text_auto=".0%", color="Indicador", color_discrete_sequence=["#9fbad0", "#1f6d8c"])
-        fig.update_layout(title="¿Vamos al ritmo correcto?", showlegend=False, yaxis_tickformat=".0%", yaxis_range=[0, max(.5, progress["Porcentaje"].max() * 1.25)], height=360)
+        progress = pd.DataFrame({
+            "Indicador": ["Mes transcurrido", "Forecast facturado", "Forecast asegurado"],
+            "Porcentaje": [
+                elapsed,
+                sold_forecast / forecast_total if forecast_total else 0,
+                forecast_secured_rate,
+            ],
+        })
+        fig = px.bar(
+            progress,
+            x="Indicador",
+            y="Porcentaje",
+            text_auto=".0%",
+            color="Indicador",
+            color_discrete_sequence=["#9fbad0", "#1f6d8c", "#43aa8b"],
+        )
+        fig.update_layout(
+            title="¿Vamos al ritmo correcto y cuánto ya está asegurado?",
+            showlegend=False,
+            yaxis_tickformat=".0%",
+            yaxis_range=[0, max(.5, progress["Porcentaje"].max() * 1.25)],
+            height=360,
+        )
         st.plotly_chart(fig, width="stretch")
+
     with right:
         counts = analysis["status"].value_counts().rename_axis("Estado").reset_index(name="Productos")
-        fig = px.bar(counts, x="Productos", y="Estado", orientation="h", color="Estado", color_discrete_map=COLORS, text_auto=True)
-        fig.update_layout(title="Productos por estado", showlegend=False, height=360, yaxis={"categoryorder": "total ascending"})
+        fig = px.bar(
+            counts,
+            x="Productos",
+            y="Estado",
+            orientation="h",
+            color="Estado",
+            color_discrete_map=COLORS,
+            text_auto=True,
+        )
+        fig.update_layout(
+            title="Estado del portafolio",
+            showlegend=False,
+            height=360,
+            yaxis={"categoryorder": "total ascending"},
+        )
         st.plotly_chart(fig, width="stretch")
 
-    st.subheader("Atención inmediata")
-    urgent = analysis[analysis["status"].isin(["No hay stock", "Falta stock"])].head(10)
-    for _, row in urgent.iterrows():
-        with st.container(border=True):
-            st.markdown(f"**{row['status']} · {row['code']}** — {row['product']}")
-            st.caption(f"Forecast {row.forecast:,.0f} · Vendido {row.sold:,.0f} · Stock {row.available:,.0f}")
-            st.markdown(f"**{row.action}**")
+    st.subheader("Atención inmediata · Top 5")
+    st.caption("Los productos que requieren acción primero por pedidos sin cobertura, falta de stock o riesgo de incumplir el forecast.")
+
+    urgent = summary_analysis.copy()
+    urgent["attention_rank"] = 3
+    urgent.loc[urgent["missing_stock"].gt(0), "attention_rank"] = 2
+    urgent.loc[
+        urgent["available"].le(0) & urgent["remaining"].gt(0),
+        "attention_rank",
+    ] = 1
+    urgent.loc[urgent["confirmed_uncovered"].gt(0), "attention_rank"] = 0
+    urgent["attention_units"] = urgent[
+        ["confirmed_uncovered", "missing_stock", "remaining"]
+    ].max(axis=1)
+    urgent = urgent[
+        urgent["attention_rank"].lt(3)
+    ].sort_values(
+        ["attention_rank", "attention_units"],
+        ascending=[True, False],
+    ).head(5)
+
+    if urgent.empty:
+        st.success("No hay alertas críticas de abastecimiento en este corte.")
+    else:
+        for _, row in urgent.iterrows():
+            if row["confirmed_uncovered"] > 0:
+                headline = "🔴 Pedido sin cobertura"
+                recommendation = (
+                    f"Cubrir {row['confirmed_uncovered']:,.0f} unidades de pedidos confirmados."
+                )
+            elif row["available"] <= 0 and row["remaining"] > 0:
+                headline = "🔴 Sin stock"
+                recommendation = f"Reponer {row['remaining']:,.0f} unidades."
+            else:
+                headline = "🟠 Falta stock"
+                recommendation = (
+                    f"Reponer {row['missing_stock']:,.0f} unidades para poder cumplir el forecast."
+                )
+
+            with st.container(border=True):
+                st.markdown(f"**{headline} · {row['code']}** — {row['product']}")
+                st.caption(
+                    f"Forecast {row.forecast:,.0f} · Facturado {row.sold:,.0f} · "
+                    f"Pedido por venir {row.upcoming_order:,.0f} · Stock {row.available:,.0f}"
+                )
+                st.markdown(f"**{recommendation}**")
 
 with tab2:
-    chosen = st.multiselect("Mostrar estados", list(COLORS), default=["No hay stock", "Falta stock", "Va lento", "Hay que venderlo"])
-    actions = analysis[analysis["status"].isin(chosen)].copy()
-    show = actions[["status", "code", "product", "forecast", "sold", "available", "remaining", "missing_stock", "action"]].rename(columns={"status":"Estado", "code":"Código", "product":"Producto", "forecast":"Forecast", "sold":"Vendido", "available":"Stock", "remaining":"Falta vender", "missing_stock":"Stock faltante", "action":"Qué hacer"})
-    st.dataframe(show, width="stretch", hide_index=True, column_config={"Código": st.column_config.TextColumn(), "Forecast": st.column_config.NumberColumn(format="%,.0f"), "Vendido": st.column_config.NumberColumn(format="%,.0f"), "Stock": st.column_config.NumberColumn(format="%,.0f"), "Falta vender": st.column_config.NumberColumn(format="%,.0f"), "Stock faltante": st.column_config.NumberColumn(format="%,.0f")})
+    st.subheader("Centro de alertas comerciales")
+    st.caption("Prioriza abastecimiento, pedidos confirmados, ritmo de venta y stock para decidir qué atender primero esta semana.")
+
+    alerts = analysis.copy()
+    upcoming_order = st.session_state.get(
+        "current_weekly_order",
+        pd.DataFrame(columns=["code", "ordered"]),
+    )
+
+    if not upcoming_order.empty:
+        alerts = alerts.merge(
+            upcoming_order.rename(columns={"ordered": "upcoming_order"}),
+            on="code",
+            how="left",
+        )
+    else:
+        alerts["upcoming_order"] = 0
+
+    for column in ["upcoming_order", "available", "sold", "remaining", "missing_stock"]:
+        alerts[column] = pd.to_numeric(alerts[column], errors="coerce").fillna(0)
+    alerts["forecast"] = pd.to_numeric(alerts["forecast"], errors="coerce")
+
+    alerts["forecast_after_upcoming"] = (
+        alerts["forecast"].fillna(0)
+        - alerts["sold"]
+        - alerts["upcoming_order"]
+    )
+    alerts["forecast_unsecured"] = alerts["forecast_after_upcoming"].clip(lower=0)
+    alerts["confirmed_uncovered"] = (
+        alerts["upcoming_order"] - alerts["available"]
+    ).clip(lower=0)
+
+    alerts["is_slow"] = (
+        alerts["forecast"].fillna(0).gt(0)
+        & alerts["advance"].notna()
+        & alerts["advance"].lt(elapsed - 0.10)
+        & alerts["sold"].lt(alerts["forecast"].fillna(0))
+    )
+
+    def commercial_priority(row):
+        if row["confirmed_uncovered"] > 0:
+            return "CRÍTICO"
+        if row["available"] <= 0 and row["remaining"] > 0:
+            return "CRÍTICO"
+        if row["missing_stock"] > 0:
+            return "ALTO"
+        if row["is_slow"] and row["forecast_unsecured"] > 0:
+            return "ALTO"
+        if row["status"] in ["Hay que venderlo", "Más rápido", "Revisar dato"]:
+            return "MEDIO"
+        return "BAJO"
+
+    alerts["commercial_priority"] = alerts.apply(commercial_priority, axis=1)
+    priority_order = {"CRÍTICO": 0, "ALTO": 1, "MEDIO": 2, "BAJO": 3}
+    alerts["priority_rank"] = alerts["commercial_priority"].map(priority_order).fillna(99)
+    alerts["impact_units"] = alerts[
+        ["confirmed_uncovered", "missing_stock", "forecast_unsecured", "available"]
+    ].max(axis=1)
+
+    def priority_action(row):
+        if row["confirmed_uncovered"] > 0:
+            return (
+                f"URGENTE: cubrir {row['confirmed_uncovered']:,.0f} unidades "
+                "de pedidos confirmados sin stock suficiente."
+            )
+        if row["available"] <= 0 and row["remaining"] > 0:
+            return f"Sin stock. Reponer {row['remaining']:,.0f} unidades."
+        if row["missing_stock"] > 0:
+            return (
+                f"Reponer {row['missing_stock']:,.0f} unidades "
+                "para poder cumplir el forecast."
+            )
+        if row["is_slow"] and row["forecast_unsecured"] > 0:
+            return (
+                f"Impulsar venta. Quedan {row['forecast_unsecured']:,.0f} unidades "
+                "del forecast sin asegurar."
+            )
+        if row["status"] == "Hay que venderlo":
+            return (
+                f"Activar venta/promoción. Hay {row['available']:,.0f} unidades "
+                "en inventario."
+            )
+        if row["status"] == "Más rápido":
+            return (
+                "Venta por encima del ritmo. Monitorear inventario y evitar "
+                "promoción agresiva."
+            )
+        if row["status"] == "Meta cumplida":
+            return "Meta cumplida. No requiere impulso comercial."
+        return row["action"]
+
+    alerts["priority_action"] = alerts.apply(priority_action, axis=1)
+
+    critical_skus = int((alerts["commercial_priority"] == "CRÍTICO").sum())
+    uncovered_units = float(alerts["confirmed_uncovered"].sum())
+    missing_units = float(alerts["missing_stock"].sum())
+    slow_skus = int(alerts["is_slow"].sum())
+    push_skus = int((alerts["status"] == "Hay que venderlo").sum())
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("🔴 SKU críticos", f"{critical_skus:,}")
+    k2.metric("📦 Pedidos sin cobertura", f"{uncovered_units:,.0f} un.")
+    k3.metric("⚠️ Faltante para forecast", f"{missing_units:,.0f} un.")
+    k4.metric("📉 SKU atrasados", f"{slow_skus:,}")
+    k5.metric("📣 Hay que vender", f"{push_skus:,}")
+
+    st.divider()
+    st.subheader("Prioridades de esta semana")
+
+    top_alerts = alerts[
+        alerts["commercial_priority"].isin(["CRÍTICO", "ALTO"])
+    ].copy()
+    top_alerts = top_alerts.sort_values(
+        ["priority_rank", "impact_units"],
+        ascending=[True, False],
+    ).head(10)
+
+    priority_labels = {
+        "CRÍTICO": "🔴 CRÍTICO",
+        "ALTO": "🟠 ALTO",
+        "MEDIO": "🟡 MEDIO",
+        "BAJO": "🟢 BAJO",
+    }
+
+    if top_alerts.empty:
+        st.success("No hay alertas críticas o altas en este corte.")
+    else:
+        top_alerts["Prioridad"] = top_alerts["commercial_priority"].map(priority_labels)
+        top_show = top_alerts[
+            [
+                "Prioridad", "code", "product", "status", "forecast", "sold",
+                "upcoming_order", "available", "confirmed_uncovered", "missing_stock",
+                "priority_action",
+            ]
+        ].rename(
+            columns={
+                "code": "Código",
+                "product": "Producto",
+                "status": "Estado",
+                "forecast": "Forecast",
+                "sold": "Facturado",
+                "upcoming_order": "Pedido por venir",
+                "available": "Stock",
+                "confirmed_uncovered": "Pedido sin cobertura",
+                "missing_stock": "Stock faltante",
+                "priority_action": "Acción inmediata",
+            }
+        )
+        st.dataframe(
+            top_show,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Código": st.column_config.TextColumn(),
+                "Producto": st.column_config.TextColumn(width="large"),
+                "Forecast": st.column_config.NumberColumn(format="%,.0f"),
+                "Facturado": st.column_config.NumberColumn(format="%,.0f"),
+                "Pedido por venir": st.column_config.NumberColumn(format="%,.0f"),
+                "Stock": st.column_config.NumberColumn(format="%,.0f"),
+                "Pedido sin cobertura": st.column_config.NumberColumn(format="%,.0f"),
+                "Stock faltante": st.column_config.NumberColumn(format="%,.0f"),
+                "Acción inmediata": st.column_config.TextColumn(width="large"),
+            },
+        )
+
+    st.divider()
+    st.subheader("Detalle de alertas")
+
+    f1, f2 = st.columns(2)
+    with f1:
+        selected_priorities = st.multiselect(
+            "Prioridad",
+            ["CRÍTICO", "ALTO", "MEDIO", "BAJO"],
+            default=["CRÍTICO", "ALTO", "MEDIO"],
+            key="action_priority_filter",
+        )
+    with f2:
+        selected_status = st.multiselect(
+            "Estado",
+            list(COLORS),
+            default=[
+                "No hay stock", "Falta stock", "Va lento",
+                "Hay que venderlo", "Más rápido",
+            ],
+            key="action_status_filter",
+        )
+
+    search_action = st.text_input(
+        "Buscar código o producto",
+        key="action_search",
+    )
+
+    detail = alerts[
+        alerts["commercial_priority"].isin(selected_priorities)
+        & alerts["status"].isin(selected_status)
+    ].copy()
+
+    if search_action:
+        detail = detail[
+            detail["code"].str.contains(search_action, case=False, na=False)
+            | detail["product"].str.contains(search_action, case=False, na=False)
+        ]
+
+    detail = detail.sort_values(
+        ["priority_rank", "impact_units"],
+        ascending=[True, False],
+    )
+    detail["Prioridad"] = detail["commercial_priority"].map(priority_labels)
+    detail_show = detail[
+        [
+            "Prioridad", "status", "code", "product", "forecast", "sold",
+            "upcoming_order", "forecast_unsecured", "available",
+            "confirmed_uncovered", "missing_stock", "priority_action",
+        ]
+    ].rename(
+        columns={
+            "status": "Estado",
+            "code": "Código",
+            "product": "Producto",
+            "forecast": "Forecast",
+            "sold": "Facturado",
+            "upcoming_order": "Pedido por venir",
+            "forecast_unsecured": "Forecast sin asegurar",
+            "available": "Stock",
+            "confirmed_uncovered": "Pedido sin cobertura",
+            "missing_stock": "Stock faltante",
+            "priority_action": "Qué hacer",
+        }
+    )
+
+    st.dataframe(
+        detail_show,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Código": st.column_config.TextColumn(),
+            "Producto": st.column_config.TextColumn(width="large"),
+            "Forecast": st.column_config.NumberColumn(format="%,.0f"),
+            "Facturado": st.column_config.NumberColumn(format="%,.0f"),
+            "Pedido por venir": st.column_config.NumberColumn(format="%,.0f"),
+            "Forecast sin asegurar": st.column_config.NumberColumn(format="%,.0f"),
+            "Stock": st.column_config.NumberColumn(format="%,.0f"),
+            "Pedido sin cobertura": st.column_config.NumberColumn(format="%,.0f"),
+            "Stock faltante": st.column_config.NumberColumn(format="%,.0f"),
+            "Qué hacer": st.column_config.TextColumn(width="large"),
+        },
+    )
 
 with tab3:
     search = st.text_input("Buscar código o producto")
@@ -867,7 +1376,7 @@ with tab5:
 with tab6:
     st.subheader("¿Cabe el pedido de esta semana en el forecast?")
     st.caption("Forecast pendiente = forecast del mes − facturación nacional. Las facturas de exportación (001-901) se muestran aparte y no consumen forecast. Todas las cantidades son unidades individuales.")
-    entry_method = st.radio("Cómo ingresar el pedido", ["Subir PDF de clientes", "Subir Excel o CSV", "Escribir pedido"], horizontal=True)
+    entry_method = st.radio("Cómo ingresar el pedido", ["Subir PDF de clientes", "Foto pedido Coral", "Subir Excel o CSV", "Escribir pedido"], horizontal=True)
     weekly_order = pd.DataFrame(columns=["code", "ordered"])
     if entry_method == "Subir PDF de clientes":
         order_pdfs = st.file_uploader("Pedidos de TIA, El Rosado o Supermaxi (.pdf)", type="pdf", accept_multiple_files=True, key="weekly_order_pdfs")
@@ -914,6 +1423,55 @@ with tab6:
                         weekly_order = prepare_weekly_order(edited_lines, "Código SKU", "Unidades pedidas")
             except Exception as exc:
                 st.error(f"No pude leer los PDF de pedidos: {exc}")
+    elif entry_method == "Foto pedido Coral":
+        coral_image = st.file_uploader(
+            "Foto del pedido de Coral (.jpg, .jpeg o .png)",
+            type=["jpg", "jpeg", "png"],
+            key="coral_order_image",
+        )
+        st.caption("La app leerá PRODUCTO + CANTIDAD, buscará el SKU más parecido en su forecast/stock y le permitirá corregirlo antes de usar el pedido.")
+        if coral_image is not None:
+            try:
+                coral_lines, coral_ocr = read_coral_order_image(coral_image, forecast_df, stock_df)
+                st.write(f"Se identificaron **{len(coral_lines)} líneas**; total provisional: **{coral_lines['Cantidad'].sum():,.0f} unidades**.")
+                st.caption("Verde = SKU identificado automáticamente. Rojo = revise el SKU. Las cantidades también son editables.")
+
+                needs_review = coral_lines["Código SKU"].fillna("").astype(str).str.fullmatch(r"\d{8}").eq(False)
+                styled_coral = coral_lines.style.apply(
+                    lambda column: [
+                        "background-color: #ffe2e2; color: #8b1010; font-weight: 700" if needs_review.iloc[pos]
+                        else "background-color: #e0f3e7; color: #176238"
+                        for pos in range(len(column))
+                    ],
+                    subset=["Producto leído", "Revisión"],
+                )
+                edited_coral = st.data_editor(
+                    styled_coral,
+                    width="stretch",
+                    hide_index=True,
+                    num_rows="fixed",
+                    key="coral_order_review",
+                    disabled=["Cliente", "Producto leído", "Producto identificado", "Coincidencia", "Revisión"],
+                    column_config={
+                        "Cantidad": st.column_config.NumberColumn(min_value=1, step=1, format="%,.0f"),
+                        "Código SKU": st.column_config.TextColumn(help="Código interno de 8 dígitos"),
+                        "Coincidencia": st.column_config.ProgressColumn(min_value=0.0, max_value=1.0, format="%.0%%"),
+                    },
+                )
+
+                codes = edited_coral["Código SKU"].fillna("").astype(str).str.strip()
+                quantities = pd.to_numeric(edited_coral["Cantidad"], errors="coerce")
+                invalid_codes = ~codes.str.fullmatch(r"\d{8}")
+                invalid_qty = quantities.isna() | (quantities <= 0)
+                if invalid_codes.any():
+                    st.warning(f"Revise {int(invalid_codes.sum())} SKU antes de usar el pedido de Coral.")
+                if invalid_qty.any():
+                    st.error(f"Revise {int(invalid_qty.sum())} cantidades.")
+                if not invalid_codes.any() and not invalid_qty.any():
+                    weekly_order = prepare_weekly_order(edited_coral, "Código SKU", "Cantidad")
+            except Exception as exc:
+                st.error(f"No pude leer la foto del pedido de Coral: {exc}")
+
     elif entry_method == "Subir Excel o CSV":
         order_file = st.file_uploader("Pedido semanal (.xlsx o .csv)", type=["xlsx", "csv"], key="weekly_order_file")
         st.caption("El archivo debe incluir una columna de código de producto y otra de cantidad solicitada. Puede elegirlas abajo.")
@@ -1144,6 +1702,37 @@ with tab7:
     else:
         invoices_for_fill_rate = fill_rate_invoice_df if not fill_rate_invoice_df.empty else invoice_df
         order_summary, fill_detail = reconcile_fill_rate(orders_df, invoices_for_fill_rate, pd.Timestamp.today())
+
+        # Visible diagnostics: distinguish "data loaded" from "data matched".
+        order_keys = set(orders_df["Orden"].map(canonical_order)) - {""}
+        invoice_order_keys = set(
+            invoices_for_fill_rate.get("purchase_order", pd.Series(dtype=str)).map(canonical_order)
+        ) - {""}
+        matched_order_keys = order_keys & invoice_order_keys
+        matched_lines = int((pd.to_numeric(fill_detail.get("Facturas", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0).sum()) if not fill_detail.empty else 0
+
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("OC cargadas", f"{len(order_keys):,}")
+        d2.metric("OC detectadas en facturas", f"{len(invoice_order_keys):,}")
+        d3.metric("OC conciliadas", f"{len(matched_order_keys):,}")
+        d4.metric("Líneas OC + SKU conciliadas", f"{matched_lines:,}")
+
+        if order_keys and invoice_order_keys and not matched_order_keys:
+            st.error(
+                "Las órdenes y las facturas están cargadas, pero sus números de OC no están coincidiendo. "
+                "La app ahora normaliza espacios y guiones; vuelva a guardar las facturas del Fill Rate "
+                "para que se relean los números de OC con la corrección."
+            )
+        elif matched_order_keys and matched_lines == 0:
+            st.warning(
+                "Los números de OC sí coinciden, pero todavía no coincide ningún SKU dentro de esas órdenes. "
+                "Revise los códigos SKU identificados en las órdenes de compra."
+            )
+        elif matched_lines > 0:
+            st.success(
+                f"Conciliación activa: {len(matched_order_keys)} OC y {matched_lines} líneas OC + SKU tienen facturación asociada."
+            )
+
         expired = order_summary[order_summary["Estado_plazo"] == "Vencida"]
         active_orders = order_summary[order_summary["Estado_plazo"] == "En plazo"]
         final_rate = expired["Facturadas"].sum() / expired["Pedidas"].sum() if expired["Pedidas"].sum() else 0
@@ -1176,7 +1765,7 @@ with tab7:
                 column_config={"Código": st.column_config.TextColumn(), "Pedido": st.column_config.NumberColumn(format="%,.0f"), "Facturado": st.column_config.NumberColumn(format="%,.0f"), "Pendiente": st.column_config.NumberColumn(format="%,.0f"), "Última factura": st.column_config.DateColumn(format="DD/MM/YYYY")},
             )
 
-        invoice_orders = set(invoice_df.get("purchase_order", pd.Series(dtype=str)).map(canonical_order)) - {""}
+        invoice_orders = set(invoices_for_fill_rate.get("purchase_order", pd.Series(dtype=str)).map(canonical_order)) - {""}
         saved_orders = set(orders_df["Orden"].map(canonical_order))
         unmatched = invoice_orders - saved_orders
         if unmatched:
