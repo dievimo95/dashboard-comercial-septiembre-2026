@@ -386,6 +386,8 @@ def profitability_lines(invoices, costs):
     result["gross_profit"] = result["net_sales"] - result["cost_of_sales"]
     result["gross_margin"] = result["gross_profit"] / result["net_sales"].replace(0, pd.NA)
     result["real_avg_price"] = result["net_sales"] / result["quantity"].replace(0, pd.NA)
+    result["gross_before_discount"] = result["quantity"] * result["unit_price"]
+    result["discount_amount"] = result["gross_before_discount"] - result["net_sales"]
     return result
 
 
@@ -2076,8 +2078,9 @@ with tab8:
 
             net_total, cost_total, profit_total = filtered["net_sales"].sum(), filtered["cost_of_sales"].sum(), filtered["gross_profit"].sum()
             margin_total = profit_total / net_total if net_total else pd.NA
-            sku_base = filtered.groupby(["code", "product"], as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo_unitario=("unit_cost", "first"), Costo_vendido=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
+            sku_base = filtered.groupby(["code", "product", "invoice_type"], as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Venta_lista=("gross_before_discount", "sum"), Descuento_valor=("discount_amount", "sum"), Costo_unitario=("unit_cost", "first"), Costo_vendido=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
             sku_base["Precio_promedio"] = sku_base["Venta"] / sku_base["Unidades"].replace(0, pd.NA)
+            sku_base["Descuento_promedio"] = sku_base["Descuento_valor"] / sku_base["Venta_lista"].replace(0, pd.NA)
             sku_base["Margen"] = sku_base["Utilidad"] / sku_base["Venta"].replace(0, pd.NA)
             sku_base["Semáforo"] = sku_base["Margen"].map(
                 lambda value: "🔴 Pérdida" if value < 0 else "🟠 Crítico" if value <= margin_low / 100 else "🟡 Revisar" if value <= margin_good / 100 else "🟢 Saludable"
@@ -2093,8 +2096,14 @@ with tab8:
             view1, view2, view3, view4 = st.tabs(["Por SKU", "Por cliente", "Cliente × SKU", "Top y Bottom"])
             with view1:
                 sort_label = st.selectbox("Ordenar por", ["Venta", "Utilidad", "Margen", "Unidades"], key="profit_sort")
-                sku_show = sku_base.sort_values(sort_label, ascending=False).rename(columns={"code":"Código", "product":"Producto", "Precio_promedio":"Precio promedio real", "Costo_unitario":"Costo unitario", "Costo_vendido":"Costo vendido $", "Utilidad":"Utilidad bruta $", "Margen":"Margen bruto %", "Venta":"Venta neta $", "Unidades":"Unidades vendidas"})
-                st.dataframe(sku_show, hide_index=True, width="stretch", column_config={"Venta neta $":st.column_config.NumberColumn(format="$%,.2f"), "Precio promedio real":st.column_config.NumberColumn(format="$%,.4f"), "Costo unitario":st.column_config.NumberColumn(format="$%,.5f"), "Costo vendido $":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad bruta $":st.column_config.NumberColumn(format="$%,.2f"), "Margen bruto %":st.column_config.NumberColumn(format="%.1%%")})
+                st.caption("Cada SKU aparece separado por tipo de venta. Las filas de exportación se resaltan porque pueden tener un descuento comercial adicional.")
+                sku_show = sku_base.sort_values(sort_label, ascending=False).rename(columns={"code":"Código", "product":"Producto", "invoice_type":"Tipo de venta", "Precio_promedio":"Precio promedio real", "Descuento_promedio":"Descuento promedio %", "Costo_unitario":"Costo unitario", "Costo_vendido":"Costo vendido $", "Utilidad":"Utilidad bruta $", "Margen":"Margen bruto %", "Venta":"Venta neta $", "Unidades":"Unidades vendidas"})
+                sku_show = sku_show[["Código", "Producto", "Tipo de venta", "Semáforo", "Unidades vendidas", "Venta neta $", "Precio promedio real", "Descuento promedio %", "Costo unitario", "Costo vendido $", "Utilidad bruta $", "Margen bruto %"]]
+                styled_sku = sku_show.style.apply(
+                    lambda row: ["background-color: #fff3cd; color: #7a4b00; font-weight: 600"] * len(row) if row["Tipo de venta"] == "Exportación" else [""] * len(row),
+                    axis=1,
+                )
+                st.dataframe(styled_sku, hide_index=True, width="stretch", column_config={"Venta neta $":st.column_config.NumberColumn(format="$%,.2f"), "Precio promedio real":st.column_config.NumberColumn(format="$%,.4f"), "Descuento promedio %":st.column_config.NumberColumn(format="%.1%%"), "Costo unitario":st.column_config.NumberColumn(format="$%,.5f"), "Costo vendido $":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad bruta $":st.column_config.NumberColumn(format="$%,.2f"), "Margen bruto %":st.column_config.NumberColumn(format="%.1%%")})
             client_base = filtered.groupby("customer", as_index=False).agg(Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"), Unidades=("quantity", "sum"))
             client_base["Margen"] = client_base["Utilidad"] / client_base["Venta"].replace(0, pd.NA)
             with view2:
@@ -2105,12 +2114,12 @@ with tab8:
                 mode = st.radio("Comparar", ["SKU dentro de un cliente", "Un SKU entre clientes"], horizontal=True, key="profit_cross_mode")
                 if mode == "SKU dentro de un cliente":
                     chosen = st.selectbox("Cliente", sorted(filtered["customer"].unique()), key="profit_cross_client")
-                    cross = filtered[filtered["customer"] == chosen].groupby(["code", "product"], as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
+                    cross = filtered[filtered["customer"] == chosen].groupby(["code", "product", "invoice_type"], as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
                 else:
-                    sku_choices = sku_base.assign(label=lambda frame: frame["code"] + " · " + frame["product"])
+                    sku_choices = sku_base.assign(label=lambda frame: frame["code"] + " · " + frame["product"]).drop_duplicates("label")
                     chosen_label = st.selectbox("SKU", sku_choices["label"].tolist(), key="profit_cross_sku")
                     chosen_code = chosen_label.split(" · ", 1)[0]
-                    cross = filtered[filtered["code"] == chosen_code].groupby("customer", as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
+                    cross = filtered[filtered["code"] == chosen_code].groupby(["customer", "invoice_type"], as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
                 cross["Margen"] = cross["Utilidad"] / cross["Venta"].replace(0, pd.NA)
                 st.dataframe(cross, hide_index=True, width="stretch", column_config={"Venta":st.column_config.NumberColumn(format="$%,.2f"), "Costo":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad":st.column_config.NumberColumn(format="$%,.2f"), "Margen":st.column_config.NumberColumn(format="%.1%%")})
             with view4:
