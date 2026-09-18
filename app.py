@@ -1977,11 +1977,13 @@ with tab8:
             cost_candidate = read_profitability_costs(profit_cost_file) if profit_cost_file else saved_profit_costs.copy()
             month_period = pd.Period(selected_month, freq="M")
             outside_month = int((invoice_candidate["date"].dt.to_period("M") != month_period).sum()) if not invoice_candidate.empty else 0
-            duplicate_cost_codes = sorted(cost_candidate.loc[cost_candidate.duplicated("code", keep=False), "code"].dropna().unique()) if not cost_candidate.empty else []
-            zero_cost_codes = sorted(cost_candidate.loc[pd.to_numeric(cost_candidate.get("unit_cost"), errors="coerce").fillna(0).le(0), "code"].dropna().unique()) if not cost_candidate.empty else []
-            exp_codes = sorted(code for code in cost_candidate.get("code", pd.Series(dtype=str)).dropna().unique() if str(code).startswith("EXP"))
             invoiced_codes = set(invoice_candidate.get("code", pd.Series(dtype=str)).dropna())
-            valid_cost_codes = set(cost_candidate.loc[~cost_candidate["code"].isin(duplicate_cost_codes + zero_cost_codes), "code"]) if not cost_candidate.empty else set()
+            all_duplicate_cost_codes = set(cost_candidate.loc[cost_candidate.duplicated("code", keep=False), "code"].dropna().unique()) if not cost_candidate.empty else set()
+            all_zero_cost_codes = set(cost_candidate.loc[pd.to_numeric(cost_candidate.get("unit_cost"), errors="coerce").fillna(0).le(0), "code"].dropna().unique()) if not cost_candidate.empty else set()
+            duplicate_cost_codes = sorted(all_duplicate_cost_codes & invoiced_codes)
+            zero_cost_codes = sorted(all_zero_cost_codes & invoiced_codes)
+            exp_codes = sorted(code for code in invoiced_codes if str(code).startswith("EXP"))
+            valid_cost_codes = set(cost_candidate.loc[~cost_candidate["code"].isin(all_duplicate_cost_codes | all_zero_cost_codes), "code"]) if not cost_candidate.empty else set()
             missing_cost_codes = sorted(invoiced_codes - valid_cost_codes)
             errors = []
             if invoice_candidate.empty:
@@ -1996,11 +1998,11 @@ with tab8:
             if upload_duplicate_ids:
                 warnings.append(f"El lote contiene {len(upload_duplicate_ids)} números de factura repetidos; se conservarán sus líneas una sola vez.")
             if duplicate_cost_codes:
-                warnings.append(f"Hay {len(duplicate_cost_codes)} SKU duplicados en costos; no se calculará su margen hasta corregirlos.")
+                warnings.append(f"Hay {len(duplicate_cost_codes)} SKU facturados que están duplicados en costos; no se calculará su margen hasta corregirlos.")
             if zero_cost_codes:
-                warnings.append(f"Hay {len(zero_cost_codes)} SKU con costo cero o inválido.")
+                warnings.append(f"Hay {len(zero_cost_codes)} SKU facturados con costo cero o inválido.")
             if exp_codes:
-                warnings.append(f"Hay {len(exp_codes)} códigos EXP en costos. Se mantendrán separados del SKU nacional.")
+                warnings.append(f"Hay {len(exp_codes)} códigos EXP facturados. Se mantendrán separados del SKU nacional.")
             negative_lines = int(((invoice_candidate.get("quantity", 0) < 0) | (invoice_candidate.get("net_sales", 0) < 0)).sum()) if not invoice_candidate.empty else 0
             if negative_lines:
                 warnings.append(f"Se detectaron {negative_lines} líneas negativas; se tratarán como devoluciones/notas de crédito.")
