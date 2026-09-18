@@ -382,6 +382,8 @@ def unpack_profit_store(encoded):
 def profitability_lines(invoices, costs):
     clean_costs = costs.drop_duplicates("code", keep=False).copy()
     result = invoices.merge(clean_costs[["code", "cost_product", "unit_cost", "uom"]], on="code", how="left")
+    for column in ["quantity", "unit_price", "net_sales", "unit_cost"]:
+        result[column] = pd.to_numeric(result[column], errors="coerce")
     result["cost_of_sales"] = result["quantity"] * result["unit_cost"]
     result["gross_profit"] = result["net_sales"] - result["cost_of_sales"]
     result["gross_margin"] = result["gross_profit"] / result["net_sales"].replace(0, pd.NA)
@@ -1610,7 +1612,7 @@ with tab6:
                     column_config={
                         "Cantidad": st.column_config.NumberColumn(min_value=1, step=1, format="%,.0f"),
                         "Código SKU": st.column_config.TextColumn(help="Código interno de 8 dígitos"),
-                        "Coincidencia": st.column_config.ProgressColumn(min_value=0.0, max_value=1.0, format="%.0%%"),
+                        "Coincidencia": st.column_config.ProgressColumn(min_value=0.0, max_value=1.0),
                     },
                 )
 
@@ -2101,15 +2103,19 @@ with tab8:
                 st.caption("Cada SKU aparece separado por tipo de venta. Las filas de exportación se resaltan porque pueden tener un descuento comercial adicional.")
                 sku_show = sku_base.sort_values(sort_label, ascending=False).rename(columns={"code":"Código", "product":"Producto", "invoice_type":"Tipo de venta", "Precio_promedio":"Precio promedio real", "Descuento_promedio":"Descuento promedio %", "Costo_unitario":"Costo unitario", "Costo_vendido":"Costo vendido $", "Utilidad":"Utilidad bruta $", "Margen":"Margen bruto %", "Venta":"Venta neta $", "Unidades":"Unidades vendidas"})
                 sku_show = sku_show[["Código", "Producto", "Tipo de venta", "Semáforo", "Unidades vendidas", "Venta neta $", "Precio promedio real", "Descuento promedio %", "Costo unitario", "Costo vendido $", "Utilidad bruta $", "Margen bruto %"]]
+                sku_show["Descuento promedio %"] = sku_show["Descuento promedio %"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
+                sku_show["Margen bruto %"] = sku_show["Margen bruto %"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
                 styled_sku = sku_show.style.apply(
                     lambda row: ["background-color: #fff3cd; color: #7a4b00; font-weight: 600"] * len(row) if row["Tipo de venta"] == "Exportación" else [""] * len(row),
                     axis=1,
                 )
-                st.dataframe(styled_sku, hide_index=True, width="stretch", column_config={"Venta neta $":st.column_config.NumberColumn(format="$%,.2f"), "Precio promedio real":st.column_config.NumberColumn(format="$%,.4f"), "Descuento promedio %":st.column_config.NumberColumn(format="%.1%%"), "Costo unitario":st.column_config.NumberColumn(format="$%,.5f"), "Costo vendido $":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad bruta $":st.column_config.NumberColumn(format="$%,.2f"), "Margen bruto %":st.column_config.NumberColumn(format="%.1%%")})
+                st.dataframe(styled_sku, hide_index=True, width="stretch", column_config={"Venta neta $":st.column_config.NumberColumn(format="$%,.2f"), "Precio promedio real":st.column_config.NumberColumn(format="$%,.4f"), "Costo unitario":st.column_config.NumberColumn(format="$%,.5f"), "Costo vendido $":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad bruta $":st.column_config.NumberColumn(format="$%,.2f")})
             client_base = filtered.groupby("customer", as_index=False).agg(Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"), Unidades=("quantity", "sum"))
             client_base["Margen"] = client_base["Utilidad"] / client_base["Venta"].replace(0, pd.NA)
             with view2:
-                st.dataframe(client_base.rename(columns={"customer":"Cliente", "Venta":"Venta neta", "Costo":"Costo vendido", "Utilidad":"Utilidad bruta", "Margen":"Margen bruto %"}).sort_values("Utilidad bruta", ascending=False), hide_index=True, width="stretch", column_config={"Venta neta":st.column_config.NumberColumn(format="$%,.2f"), "Costo vendido":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad bruta":st.column_config.NumberColumn(format="$%,.2f"), "Margen bruto %":st.column_config.NumberColumn(format="%.1%%")})
+                client_show = client_base.rename(columns={"customer":"Cliente", "Venta":"Venta neta", "Costo":"Costo vendido", "Utilidad":"Utilidad bruta", "Margen":"Margen bruto %"}).sort_values("Utilidad bruta", ascending=False)
+                client_show["Margen bruto %"] = client_show["Margen bruto %"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
+                st.dataframe(client_show, hide_index=True, width="stretch", column_config={"Venta neta":st.column_config.NumberColumn(format="$%,.2f"), "Costo vendido":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad bruta":st.column_config.NumberColumn(format="$%,.2f")})
                 chart_data = client_base.melt(id_vars="customer", value_vars=["Venta", "Utilidad"], var_name="Indicador", value_name="Dólares")
                 st.plotly_chart(px.bar(chart_data, x="customer", y="Dólares", color="Indicador", barmode="group", title="Venta neta vs. utilidad bruta por cliente"), width="stretch")
             with view3:
@@ -2123,17 +2129,23 @@ with tab8:
                     chosen_code = chosen_label.split(" · ", 1)[0]
                     cross = filtered[filtered["code"] == chosen_code].groupby(["customer", "invoice_type"], as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
                 cross["Margen"] = cross["Utilidad"] / cross["Venta"].replace(0, pd.NA)
-                st.dataframe(cross, hide_index=True, width="stretch", column_config={"Venta":st.column_config.NumberColumn(format="$%,.2f"), "Costo":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad":st.column_config.NumberColumn(format="$%,.2f"), "Margen":st.column_config.NumberColumn(format="%.1%%")})
+                cross_show = cross.copy()
+                cross_show["Margen"] = cross_show["Margen"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
+                st.dataframe(cross_show, hide_index=True, width="stretch", column_config={"Venta":st.column_config.NumberColumn(format="$%,.2f"), "Costo":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad":st.column_config.NumberColumn(format="$%,.2f")})
             with view4:
                 top_left, top_right = st.columns(2)
                 top_left.markdown("**Top 10 SKU por utilidad bruta**")
                 top_left.dataframe(sku_base.nlargest(10, "Utilidad")[["code", "product", "Utilidad"]], hide_index=True, width="stretch")
                 top_right.markdown("**Bottom 10 SKU por margen bruto**")
-                top_right.dataframe(sku_base.nsmallest(10, "Margen")[["code", "product", "Margen"]], hide_index=True, width="stretch")
+                bottom_sku = sku_base.nsmallest(10, "Margen")[["code", "product", "invoice_type", "Margen"]].copy()
+                bottom_sku["Margen"] = bottom_sku["Margen"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
+                top_right.dataframe(bottom_sku, hide_index=True, width="stretch")
                 ctop, cbottom = st.columns(2)
                 ctop.markdown("**Top clientes por utilidad**")
                 ctop.dataframe(client_base.nlargest(10, "Utilidad")[["customer", "Utilidad"]], hide_index=True, width="stretch")
                 cbottom.markdown("**Clientes con menor margen**")
-                cbottom.dataframe(client_base.nsmallest(10, "Margen")[["customer", "Margen"]], hide_index=True, width="stretch")
+                bottom_clients = client_base.nsmallest(10, "Margen")[["customer", "Margen"]].copy()
+                bottom_clients["Margen"] = bottom_clients["Margen"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
+                cbottom.dataframe(bottom_clients, hide_index=True, width="stretch")
 
 st.caption("Regla: el stock usa Cantidad disponible. Va lento si el avance está más de 10 puntos por debajo del tiempo transcurrido; va más rápido si está más de 10 puntos por encima.")
