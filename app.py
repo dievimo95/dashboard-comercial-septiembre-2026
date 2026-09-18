@@ -2099,9 +2099,12 @@ with tab8:
 
             view1, view2, view3, view4 = st.tabs(["Por SKU", "Por cliente", "Cliente × SKU", "Top y Bottom"])
             with view1:
-                sort_label = st.selectbox("Ordenar por", ["Venta", "Utilidad", "Margen", "Unidades"], key="profit_sort")
+                sort_col, type_col = st.columns([2, 1])
+                sort_label = sort_col.selectbox("Ordenar por", ["Venta", "Utilidad", "Margen", "Unidades"], key="profit_sort")
+                sku_type_filter = type_col.selectbox("Mostrar tipo de venta", ["Todos", "Nacional", "Exportación", "Otra"], key="profit_sku_type_filter")
                 st.caption("Cada SKU aparece separado por tipo de venta. Las filas de exportación se resaltan porque pueden tener un descuento comercial adicional.")
-                sku_show = sku_base.sort_values(sort_label, ascending=False).rename(columns={"code":"Código", "product":"Producto", "invoice_type":"Tipo de venta", "Precio_promedio":"Precio promedio real", "Descuento_promedio":"Descuento promedio %", "Costo_unitario":"Costo unitario", "Costo_vendido":"Costo vendido $", "Utilidad":"Utilidad bruta $", "Margen":"Margen bruto %", "Venta":"Venta neta $", "Unidades":"Unidades vendidas"})
+                sku_view = sku_base if sku_type_filter == "Todos" else sku_base[sku_base["invoice_type"] == sku_type_filter]
+                sku_show = sku_view.sort_values(sort_label, ascending=False).rename(columns={"code":"Código", "product":"Producto", "invoice_type":"Tipo de venta", "Precio_promedio":"Precio promedio real", "Descuento_promedio":"Descuento promedio %", "Costo_unitario":"Costo unitario", "Costo_vendido":"Costo vendido $", "Utilidad":"Utilidad bruta $", "Margen":"Margen bruto %", "Venta":"Venta neta $", "Unidades":"Unidades vendidas"})
                 sku_show = sku_show[["Código", "Producto", "Tipo de venta", "Semáforo", "Unidades vendidas", "Venta neta $", "Precio promedio real", "Descuento promedio %", "Costo unitario", "Costo vendido $", "Utilidad bruta $", "Margen bruto %"]]
                 sku_show["Descuento promedio %"] = sku_show["Descuento promedio %"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
                 sku_show["Margen bruto %"] = sku_show["Margen bruto %"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
