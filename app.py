@@ -4,6 +4,7 @@ import re
 import base64
 import uuid
 import zlib
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from difflib import SequenceMatcher
@@ -257,6 +258,134 @@ def read_pdf(file):
     result = pd.DataFrame(records)
     if not result.empty:
         result["purchase_order"] = result["invoice"].map(order_by_invoice).fillna("")
+    return result
+
+
+def profit_sku(value):
+    """Normalize profitability SKUs without turning EXP codes into national SKUs."""
+    if pd.isna(value):
+        return None
+    raw = str(value).strip().upper()
+    bracketed = re.search(r"\[([^\]]+)\]", raw)
+    if bracketed:
+        raw = bracketed.group(1)
+    compact = re.sub(r"[^A-Z0-9]", "", raw)
+    if not compact:
+        return None
+    return compact.zfill(8) if compact.isdigit() and len(compact) <= 8 else compact
+
+
+def _plain_header(value):
+    text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def read_profitability_costs(file):
+    raw = pd.read_excel(file, dtype=str)
+    columns = {_plain_header(column): column for column in raw.columns}
+
+    def find(*terms):
+        return next((original for normalized, original in columns.items() if all(term in normalized for term in terms)), None)
+
+    code_col = find("referencia", "interna") or find("sku") or find("codigo")
+    name_col = find("nombre") or find("producto")
+    cost_col = find("costo") or find("coste")
+    uom_col = find("unidad", "medida") or find("udm")
+    missing = [label for label, value in [("Referencia Interna", code_col), ("Nombre", name_col), ("Costo", cost_col), ("Unidad de Medida", uom_col)] if value is None]
+    if missing:
+        raise ValueError("Faltan columnas en costos: " + ", ".join(missing))
+    result = raw[[code_col, name_col, cost_col, uom_col]].copy()
+    result.columns = ["code", "cost_product", "unit_cost", "uom"]
+    result["code"] = result["code"].map(profit_sku)
+    result["unit_cost"] = result["unit_cost"].map(lambda value: number_local(value) if pd.notna(value) and str(value).strip() else pd.NA)
+    return result[result["code"].notna()].reset_index(drop=True)
+
+
+def read_profitability_pdfs(files):
+    invoice_re = re.compile(r"No\.:\s*(\d{3}-\d{3}-\d{9})")
+    issue_date_re = re.compile(r"(?:Fecha de emisi[oó]n:|Issue Date:)\s*(\d{2}/\d{2}/\d{4})", re.I)
+    auth_date_re = re.compile(r"(?:N[uú]mero de autorizaci[oó]n:|Authorization No\.:)\s*\n?(\d{8})", re.I)
+    spanish = re.compile(r"^(\d{8}|EXP[A-Z0-9._/-]*)\s+(.*?)\s+([\d.]+,\d{4})\s+([\d.]+,\d{5})\s+.*?\$\s*([\d.]+,\d{2})$")
+    english = re.compile(r"^(\d{8}|EXP[A-Z0-9._/-]*)\s+(.*?)\s+([\d,]+\.\d{4})\s+([\d,]+\.\d{5})\s+.*?\$\s*([\d,]+\.\d{2})$", re.I)
+    rows = []
+    for file in files or []:
+        source = io.BytesIO(file.getvalue()) if hasattr(file, "getvalue") else file
+        with pdfplumber.open(source) as pdf:
+            invoice, date, customer, credit = None, None, "", False
+            for page_no, page in enumerate(pdf.pages, 1):
+                text = page.extract_text() or ""
+                found = invoice_re.search(text)
+                if found:
+                    invoice = found.group(1)
+                    credit = bool(re.search(r"NOTA\s+DE\s+CR[EÉ]DITO|CREDIT\s+NOTE", text, re.I))
+                    issued, auth = issue_date_re.search(text), auth_date_re.search(text)
+                    date = datetime.strptime(issued.group(1), "%d/%m/%Y") if issued else datetime.strptime(auth.group(1), "%d%m%Y") if auth else None
+                    lines = text.splitlines()
+                    for idx, line in enumerate(lines):
+                        if ("Nombres y apellidos:" in line or "Partner:" in line) and idx + 1 < len(lines):
+                            customer = re.split(r"\s+(?:Fecha de vencimiento:|Due Date:)", lines[idx + 1])[0].strip()
+                            break
+                for line_no, raw_line in enumerate(text.splitlines(), 1):
+                    match = spanish.match(raw_line.strip()) or english.match(raw_line.strip())
+                    if not match or not invoice or not date:
+                        continue
+                    code, product, qty_raw, price_raw, net_raw = match.groups()
+                    qty, price, net = number_local(qty_raw), number_local(price_raw), number_local(net_raw)
+                    sign = -1 if credit else 1
+                    gross = abs(qty * price)
+                    discount = max(0.0, (1 - abs(net) / gross) * 100) if gross else 0.0
+                    rows.append({
+                        "date": pd.Timestamp(date), "invoice": invoice, "customer": customer or "Cliente sin identificar",
+                        "code": profit_sku(code), "product": product.strip(), "quantity": sign * abs(qty),
+                        "unit_price": price, "discount_pct": discount, "net_sales": sign * abs(net),
+                        "document_type": "Nota de crédito" if credit else "Factura", "pdf_page": page_no,
+                        "line_no": line_no, "invoice_type": "Exportación" if invoice.startswith("001-901-") else "Nacional" if invoice.startswith("001-100-") else "Otra",
+                        "source_file": getattr(file, "name", "archivo.pdf"),
+                    })
+    return pd.DataFrame(rows)
+
+
+def blank_profit_store():
+    return {"months": {}}
+
+
+def pack_profit_store(store):
+    months = {}
+    for key, value in store.get("months", {}).items():
+        months[key] = {
+            "invoices": value.get("invoices", pd.DataFrame()).to_json(orient="records", date_format="iso"),
+            "costs": value.get("costs", pd.DataFrame()).to_json(orient="records", date_format="iso"),
+        }
+    raw = json.dumps({"version": 1, "months": months}).encode("utf-8")
+    return base64.b64encode(zlib.compress(raw, level=9)).decode("ascii")
+
+
+def unpack_profit_store(encoded):
+    if not isinstance(encoded, str) or len(encoded) > 20_000_000:
+        raise ValueError("Copia de rentabilidad inválida")
+    raw = zlib.decompress(base64.b64decode(encoded, validate=True))
+    if len(raw) > 30_000_000:
+        raise ValueError("Copia de rentabilidad demasiado grande")
+    payload = json.loads(raw)
+    if payload.get("version") != 1:
+        raise ValueError("Versión de rentabilidad no compatible")
+    store = blank_profit_store()
+    for key, value in payload.get("months", {}).items():
+        invoices = pd.read_json(io.StringIO(value.get("invoices", "[]")), orient="records", dtype={"code": str}, convert_dates=False)
+        costs = pd.read_json(io.StringIO(value.get("costs", "[]")), orient="records", dtype={"code": str}, convert_dates=False)
+        if "date" in invoices:
+            invoices["date"] = pd.to_datetime(invoices["date"], errors="coerce")
+        store["months"][key] = {"invoices": invoices, "costs": costs}
+    return store
+
+
+def profitability_lines(invoices, costs):
+    clean_costs = costs.drop_duplicates("code", keep=False).copy()
+    result = invoices.merge(clean_costs[["code", "cost_product", "unit_cost", "uom"]], on="code", how="left")
+    result["cost_of_sales"] = result["quantity"] * result["unit_cost"]
+    result["gross_profit"] = result["net_sales"] - result["cost_of_sales"]
+    result["gross_margin"] = result["gross_profit"] / result["net_sales"].replace(0, pd.NA)
+    result["real_avg_price"] = result["net_sales"] / result["quantity"].replace(0, pd.NA)
     return result
 
 
@@ -709,6 +838,30 @@ if isinstance(storage_result, dict):
     elif storage_result.get("action") == "error":
         st.session_state.storage_notice = f"No se pudo guardar en este navegador: {storage_result.get('message', 'error desconocido')}"
 
+# Rentabilidad uses a separate browser record and never reads or mutates the
+# forecast/stock/fill-rate bundle above.
+if "profit_store" not in st.session_state:
+    st.session_state.profit_store = blank_profit_store()
+if "profit_storage_command" not in st.session_state:
+    st.session_state.profit_storage_command = {"action": "load", "revision": "initial-profit", "payload": ""}
+profit_command = st.session_state.profit_storage_command
+profit_storage_result = browser_store(**profit_command, key="saved_profitability_cuts")
+if isinstance(profit_storage_result, dict):
+    if profit_storage_result.get("action") == "loaded" and not st.session_state.get("profit_storage_loaded"):
+        st.session_state.profit_storage_loaded = True
+        if profit_storage_result.get("payload"):
+            try:
+                st.session_state.profit_store = unpack_profit_store(profit_storage_result["payload"])
+                st.session_state.profit_notice = "Se recuperó el histórico de Rentabilidad guardado en este navegador."
+            except Exception as exc:
+                st.session_state.profit_notice = f"No pude recuperar Rentabilidad: {exc}"
+        st.rerun()
+    elif profit_storage_result.get("action") == "saved" and profit_storage_result.get("revision") == profit_command["revision"]:
+        st.session_state.profit_storage_command = {"action": "load", "revision": profit_command["revision"], "payload": ""}
+        st.session_state.profit_notice = "Rentabilidad guardada en este navegador."
+    elif profit_storage_result.get("action") == "error":
+        st.session_state.profit_notice = f"No se pudo guardar Rentabilidad: {profit_storage_result.get('message', 'error desconocido')}"
+
 with st.sidebar:
     st.header("Actualizar información")
     st.caption("El corte validado se guarda en este navegador y vuelve al refrescar. No se comparte con otros usuarios. Conserve también sus archivos originales.")
@@ -928,7 +1081,7 @@ if sold_forecast / forecast_total > elapsed:
 else:
     st.warning(f"En general vamos atrasados: se vendió {sold_forecast / forecast_total:.1%} del forecast y ha pasado {elapsed:.1%} del mes.")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente", "Pedido semanal", "Fill Rate"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente", "Pedido semanal", "Fill Rate", "Rentabilidad"])
 
 with tab1:
     left, right = st.columns([1, 1])
@@ -1770,5 +1923,206 @@ with tab7:
         unmatched = invoice_orders - saved_orders
         if unmatched:
             st.caption(f"Hay {len(unmatched)} órdenes mencionadas en facturas que todavía no están cargadas en esta pestaña.")
+
+with tab8:
+    st.subheader("Rentabilidad · Margen bruto")
+    st.caption("Módulo independiente. Sus facturas y costos no cambian Forecast, Stock, Pedido semanal ni Fill Rate.")
+    if st.session_state.get("profit_notice"):
+        st.info(st.session_state.pop("profit_notice"))
+
+    month_labels = {1:"Enero", 2:"Febrero", 3:"Marzo", 4:"Abril", 5:"Mayo", 6:"Junio", 7:"Julio", 8:"Agosto", 9:"Septiembre", 10:"Octubre", 11:"Noviembre", 12:"Diciembre"}
+    now = pd.Timestamp.today()
+    saved_months = sorted(st.session_state.profit_store.get("months", {}).keys(), reverse=True)
+    default_month = f"{now.year:04d}-{now.month:02d}"
+    month_options = sorted(set(saved_months + [default_month]), reverse=True)
+    selected_month = st.selectbox(
+        "Mes de rentabilidad",
+        month_options,
+        format_func=lambda key: f"{month_labels[int(key[5:7])]} {key[:4]}",
+        key="profit_month",
+    )
+    month_name = f"{month_labels[int(selected_month[5:7])]} {selected_month[:4]}"
+    saved_cut = st.session_state.profit_store.get("months", {}).get(selected_month, {"invoices": pd.DataFrame(), "costs": pd.DataFrame()})
+    saved_profit_invoices = saved_cut.get("invoices", pd.DataFrame()).copy()
+    saved_profit_costs = saved_cut.get("costs", pd.DataFrame()).copy()
+    st.markdown(f"**Costos activos: {month_name}**")
+
+    up1, up2 = st.columns(2)
+    with up1:
+        profit_pdfs = st.file_uploader("Facturas para Rentabilidad (.pdf)", type="pdf", accept_multiple_files=True, key=f"profit_pdfs_{selected_month}")
+        st.caption("Puede agregar facturas nuevas del mismo mes. Las ya procesadas no se duplicarán.")
+    with up2:
+        profit_cost_file = st.file_uploader("Costos del mes desde Odoo (.xlsx)", type="xlsx", key=f"profit_costs_{selected_month}")
+        st.caption("Referencia Interna · Nombre · Costo · Unidad de Medida")
+
+    profit_signature = (selected_month, tuple(file_signature(file) for file in profit_pdfs or []), file_signature(profit_cost_file))
+    if st.session_state.get("profit_validated_signature") != profit_signature:
+        st.session_state.pop("profit_candidate", None)
+        st.session_state.pop("profit_validation", None)
+
+    if st.button("Prevalidar Rentabilidad", type="primary", key="validate_profit"):
+        try:
+            parsed = read_profitability_pdfs(profit_pdfs)
+            existing_invoice_ids = set(saved_profit_invoices.get("invoice", pd.Series(dtype=str)).astype(str))
+            repeated_invoice_ids = sorted(set(parsed.get("invoice", pd.Series(dtype=str)).astype(str)) & existing_invoice_ids)
+            new_invoices = parsed[~parsed["invoice"].astype(str).isin(existing_invoice_ids)].copy() if not parsed.empty else parsed
+            upload_duplicate_ids = (
+                new_invoices.groupby("invoice")["source_file"].nunique().loc[lambda values: values > 1].index.tolist()
+                if not new_invoices.empty and "source_file" in new_invoices else []
+            )
+            invoice_candidate = pd.concat([saved_profit_invoices, new_invoices], ignore_index=True)
+            invoice_candidate = invoice_candidate.drop_duplicates(["invoice", "pdf_page", "line_no", "code"], keep="first") if not invoice_candidate.empty else invoice_candidate
+            cost_candidate = read_profitability_costs(profit_cost_file) if profit_cost_file else saved_profit_costs.copy()
+            month_period = pd.Period(selected_month, freq="M")
+            outside_month = int((invoice_candidate["date"].dt.to_period("M") != month_period).sum()) if not invoice_candidate.empty else 0
+            duplicate_cost_codes = sorted(cost_candidate.loc[cost_candidate.duplicated("code", keep=False), "code"].dropna().unique()) if not cost_candidate.empty else []
+            zero_cost_codes = sorted(cost_candidate.loc[pd.to_numeric(cost_candidate.get("unit_cost"), errors="coerce").fillna(0).le(0), "code"].dropna().unique()) if not cost_candidate.empty else []
+            exp_codes = sorted(code for code in cost_candidate.get("code", pd.Series(dtype=str)).dropna().unique() if str(code).startswith("EXP"))
+            invoiced_codes = set(invoice_candidate.get("code", pd.Series(dtype=str)).dropna())
+            valid_cost_codes = set(cost_candidate.loc[~cost_candidate["code"].isin(duplicate_cost_codes + zero_cost_codes), "code"]) if not cost_candidate.empty else set()
+            missing_cost_codes = sorted(invoiced_codes - valid_cost_codes)
+            errors = []
+            if invoice_candidate.empty:
+                errors.append("No existen facturas de Rentabilidad para este mes.")
+            if cost_candidate.empty:
+                errors.append("No existe un archivo de costos válido para este mes.")
+            warnings = []
+            if outside_month:
+                warnings.append(f"{outside_month} líneas tienen fecha fuera de {month_name}; quedarán fuera de los resultados de este mes.")
+            if repeated_invoice_ids:
+                warnings.append(f"Se ignoraron {len(repeated_invoice_ids)} facturas que ya estaban guardadas.")
+            if upload_duplicate_ids:
+                warnings.append(f"El lote contiene {len(upload_duplicate_ids)} números de factura repetidos; se conservarán sus líneas una sola vez.")
+            if duplicate_cost_codes:
+                warnings.append(f"Hay {len(duplicate_cost_codes)} SKU duplicados en costos; no se calculará su margen hasta corregirlos.")
+            if zero_cost_codes:
+                warnings.append(f"Hay {len(zero_cost_codes)} SKU con costo cero o inválido.")
+            if exp_codes:
+                warnings.append(f"Hay {len(exp_codes)} códigos EXP en costos. Se mantendrán separados del SKU nacional.")
+            negative_lines = int(((invoice_candidate.get("quantity", 0) < 0) | (invoice_candidate.get("net_sales", 0) < 0)).sum()) if not invoice_candidate.empty else 0
+            if negative_lines:
+                warnings.append(f"Se detectaron {negative_lines} líneas negativas; se tratarán como devoluciones/notas de crédito.")
+            st.session_state.profit_validated_signature = profit_signature
+            st.session_state.profit_validation = {"errors": errors, "warnings": warnings, "missing": missing_cost_codes, "duplicates": duplicate_cost_codes, "zero": zero_cost_codes, "new_invoices": int(new_invoices['invoice'].nunique()) if not new_invoices.empty else 0}
+            if not errors:
+                st.session_state.profit_candidate = {"month": selected_month, "invoices": invoice_candidate, "costs": cost_candidate}
+        except Exception as exc:
+            st.session_state.profit_validation = {"errors": [f"No pude prevalidar Rentabilidad: {exc}"], "warnings": [], "missing": [], "duplicates": [], "zero": [], "new_invoices": 0}
+            st.session_state.pop("profit_candidate", None)
+
+    profit_validation = st.session_state.get("profit_validation")
+    if profit_validation:
+        if profit_validation["errors"]:
+            for message in profit_validation["errors"]:
+                st.error(message)
+        else:
+            st.success(f"Prevalidación completa. Facturas nuevas: {profit_validation['new_invoices']:,}.")
+        for message in profit_validation["warnings"]:
+            st.warning(message)
+        if profit_validation.get("missing"):
+            st.error(f"{len(profit_validation['missing'])} SKU facturados no tienen un costo válido. No se asumirá costo cero.")
+
+    if st.button("Guardar / actualizar Rentabilidad", disabled="profit_candidate" not in st.session_state, key="save_profit"):
+        candidate = st.session_state.profit_candidate
+        st.session_state.profit_store.setdefault("months", {})[candidate["month"]] = {"invoices": candidate["invoices"], "costs": candidate["costs"]}
+        st.session_state.profit_storage_loaded = True
+        st.session_state.profit_storage_command = {"action": "save", "revision": uuid.uuid4().hex, "payload": pack_profit_store(st.session_state.profit_store)}
+        st.session_state.pop("profit_candidate", None)
+        st.session_state.pop("profit_validation", None)
+        st.rerun()
+
+    saved_cut = st.session_state.profit_store.get("months", {}).get(selected_month)
+    if not saved_cut or saved_cut.get("invoices", pd.DataFrame()).empty or saved_cut.get("costs", pd.DataFrame()).empty:
+        st.info("Seleccione el mes, cargue facturas y costos, prevalide y guarde para ver la rentabilidad.")
+    else:
+        month_invoices = saved_cut["invoices"].copy()
+        month_invoices = month_invoices[month_invoices["date"].dt.to_period("M") == pd.Period(selected_month, freq="M")]
+        month_costs = saved_cut["costs"].copy()
+        calculated = profitability_lines(month_invoices, month_costs)
+        all_codes = calculated["code"].nunique()
+        found_codes = calculated.loc[calculated["unit_cost"].notna() & calculated["unit_cost"].gt(0), "code"].nunique()
+        missing_table = calculated[calculated["unit_cost"].isna() | calculated["unit_cost"].le(0)].groupby(["code", "product"], as_index=False).agg(Unidades=("quantity", "sum"), Venta_afectada=("net_sales", "sum"))
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("SKU facturados", f"{all_codes:,}")
+        v2.metric("SKU con costo", f"{found_codes:,}")
+        v3.metric("SKU sin costo", f"{all_codes - found_codes:,}")
+        v4.metric("Cobertura de costos", f"{found_codes / all_codes:.1%}" if all_codes else "0,0%")
+        if not missing_table.empty:
+            st.error("Existen ventas sin costo válido. Estas líneas no entran en utilidad ni margen hasta que se cargue el costo correcto.")
+            st.dataframe(missing_table.rename(columns={"code":"SKU sin costo", "product":"Producto", "Venta_afectada":"Venta afectada"}), hide_index=True, width="stretch", column_config={"Venta afectada": st.column_config.NumberColumn(format="$%,.2f"), "Unidades": st.column_config.NumberColumn(format="%,.2f")})
+
+        valid = calculated[calculated["unit_cost"].notna() & calculated["unit_cost"].gt(0)].copy()
+        if not valid.empty:
+            st.caption("Los KPI de margen incluyen únicamente líneas con costo válido. El indicador de cobertura muestra qué parte del catálogo facturado pudo calcularse.")
+            clients = sorted(valid["customer"].dropna().unique())
+            fc1, fc2, fc3 = st.columns(3)
+            selected_clients = fc1.multiselect("Cliente", clients, key="profit_client_filter")
+            sku_search = fc2.text_input("Buscar SKU o producto", key="profit_search")
+            invoice_types = fc3.multiselect("Tipo de factura", ["Nacional", "Exportación", "Otra"], default=["Nacional", "Exportación", "Otra"], key="profit_invoice_type")
+            min_date, max_date = valid["date"].min().date(), valid["date"].max().date()
+            date_range = st.date_input("Fecha", value=(min_date, max_date), min_value=min_date, max_value=max_date, key="profit_dates")
+            margin_low = st.number_input("Límite crítico (%)", value=15.0, step=1.0, key="margin_critical")
+            margin_good = st.number_input("Límite saludable (%)", value=25.0, step=1.0, key="margin_good")
+            margin_range = st.slider("Rango de margen (%)", min_value=-100, max_value=100, value=(-100, 100), key="profit_margin_range")
+            filtered = valid[valid["invoice_type"].isin(invoice_types)].copy()
+            if selected_clients:
+                filtered = filtered[filtered["customer"].isin(selected_clients)]
+            if sku_search:
+                filtered = filtered[filtered["code"].str.contains(sku_search, case=False, na=False) | filtered["product"].str.contains(sku_search, case=False, na=False)]
+            if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+                filtered = filtered[filtered["date"].dt.date.between(date_range[0], date_range[1])]
+            filtered_margin = filtered["gross_margin"] * 100
+            filtered = filtered[filtered_margin.between(margin_range[0], margin_range[1])]
+
+            net_total, cost_total, profit_total = filtered["net_sales"].sum(), filtered["cost_of_sales"].sum(), filtered["gross_profit"].sum()
+            margin_total = profit_total / net_total if net_total else pd.NA
+            sku_base = filtered.groupby(["code", "product"], as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo_unitario=("unit_cost", "first"), Costo_vendido=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
+            sku_base["Precio_promedio"] = sku_base["Venta"] / sku_base["Unidades"].replace(0, pd.NA)
+            sku_base["Margen"] = sku_base["Utilidad"] / sku_base["Venta"].replace(0, pd.NA)
+            sku_base["Semáforo"] = sku_base["Margen"].map(
+                lambda value: "🔴 Pérdida" if value < 0 else "🟠 Crítico" if value <= margin_low / 100 else "🟡 Revisar" if value <= margin_good / 100 else "🟢 Saludable"
+            )
+            k1, k2, k3, k4, k5, k6 = st.columns(6)
+            k1.metric("Venta neta", f"${net_total:,.2f}")
+            k2.metric("Costo de venta", f"${cost_total:,.2f}")
+            k3.metric("Utilidad bruta", f"${profit_total:,.2f}")
+            k4.metric("Margen bruto", f"{margin_total:.1%}" if pd.notna(margin_total) else "—")
+            k5.metric("SKU margen crítico", f"{int(((sku_base['Margen'] >= 0) & (sku_base['Margen'] <= margin_low / 100)).sum()):,}")
+            k6.metric("SKU con pérdida", f"{int((sku_base['Margen'] < 0).sum()):,}")
+
+            view1, view2, view3, view4 = st.tabs(["Por SKU", "Por cliente", "Cliente × SKU", "Top y Bottom"])
+            with view1:
+                sort_label = st.selectbox("Ordenar por", ["Venta", "Utilidad", "Margen", "Unidades"], key="profit_sort")
+                sku_show = sku_base.sort_values(sort_label, ascending=False).rename(columns={"code":"Código", "product":"Producto", "Precio_promedio":"Precio promedio real", "Costo_unitario":"Costo unitario", "Costo_vendido":"Costo vendido $", "Utilidad":"Utilidad bruta $", "Margen":"Margen bruto %", "Venta":"Venta neta $", "Unidades":"Unidades vendidas"})
+                st.dataframe(sku_show, hide_index=True, width="stretch", column_config={"Venta neta $":st.column_config.NumberColumn(format="$%,.2f"), "Precio promedio real":st.column_config.NumberColumn(format="$%,.4f"), "Costo unitario":st.column_config.NumberColumn(format="$%,.5f"), "Costo vendido $":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad bruta $":st.column_config.NumberColumn(format="$%,.2f"), "Margen bruto %":st.column_config.NumberColumn(format="%.1%%")})
+            client_base = filtered.groupby("customer", as_index=False).agg(Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"), Unidades=("quantity", "sum"))
+            client_base["Margen"] = client_base["Utilidad"] / client_base["Venta"].replace(0, pd.NA)
+            with view2:
+                st.dataframe(client_base.rename(columns={"customer":"Cliente", "Venta":"Venta neta", "Costo":"Costo vendido", "Utilidad":"Utilidad bruta", "Margen":"Margen bruto %"}).sort_values("Utilidad bruta", ascending=False), hide_index=True, width="stretch", column_config={"Venta neta":st.column_config.NumberColumn(format="$%,.2f"), "Costo vendido":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad bruta":st.column_config.NumberColumn(format="$%,.2f"), "Margen bruto %":st.column_config.NumberColumn(format="%.1%%")})
+                chart_data = client_base.melt(id_vars="customer", value_vars=["Venta", "Utilidad"], var_name="Indicador", value_name="Dólares")
+                st.plotly_chart(px.bar(chart_data, x="customer", y="Dólares", color="Indicador", barmode="group", title="Venta neta vs. utilidad bruta por cliente"), width="stretch")
+            with view3:
+                mode = st.radio("Comparar", ["SKU dentro de un cliente", "Un SKU entre clientes"], horizontal=True, key="profit_cross_mode")
+                if mode == "SKU dentro de un cliente":
+                    chosen = st.selectbox("Cliente", sorted(filtered["customer"].unique()), key="profit_cross_client")
+                    cross = filtered[filtered["customer"] == chosen].groupby(["code", "product"], as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
+                else:
+                    sku_choices = sku_base.assign(label=lambda frame: frame["code"] + " · " + frame["product"])
+                    chosen_label = st.selectbox("SKU", sku_choices["label"].tolist(), key="profit_cross_sku")
+                    chosen_code = chosen_label.split(" · ", 1)[0]
+                    cross = filtered[filtered["code"] == chosen_code].groupby("customer", as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
+                cross["Margen"] = cross["Utilidad"] / cross["Venta"].replace(0, pd.NA)
+                st.dataframe(cross, hide_index=True, width="stretch", column_config={"Venta":st.column_config.NumberColumn(format="$%,.2f"), "Costo":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad":st.column_config.NumberColumn(format="$%,.2f"), "Margen":st.column_config.NumberColumn(format="%.1%%")})
+            with view4:
+                top_left, top_right = st.columns(2)
+                top_left.markdown("**Top 10 SKU por utilidad bruta**")
+                top_left.dataframe(sku_base.nlargest(10, "Utilidad")[["code", "product", "Utilidad"]], hide_index=True, width="stretch")
+                top_right.markdown("**Bottom 10 SKU por margen bruto**")
+                top_right.dataframe(sku_base.nsmallest(10, "Margen")[["code", "product", "Margen"]], hide_index=True, width="stretch")
+                ctop, cbottom = st.columns(2)
+                ctop.markdown("**Top clientes por utilidad**")
+                ctop.dataframe(client_base.nlargest(10, "Utilidad")[["customer", "Utilidad"]], hide_index=True, width="stretch")
+                cbottom.markdown("**Clientes con menor margen**")
+                cbottom.dataframe(client_base.nsmallest(10, "Margen")[["customer", "Margen"]], hide_index=True, width="stretch")
 
 st.caption("Regla: el stock usa Cantidad disponible. Va lento si el avance está más de 10 puntos por debajo del tiempo transcurrido; va más rápido si está más de 10 puntos por encima.")
