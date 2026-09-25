@@ -261,6 +261,68 @@ def read_pdf(file):
     return result
 
 
+def read_invoice_pdfs(files):
+    """Read one or many invoice PDFs as a single upload batch."""
+    frames = []
+    for source_index, file in enumerate(files or []):
+        frame = read_pdf(file)
+        if not frame.empty:
+            frame["_upload_file_index"] = source_index
+            frames.append(frame)
+    if not frames:
+        return pd.DataFrame()
+
+    result = pd.concat(frames, ignore_index=True)
+    # If the same invoice appears in two selected PDFs, keep the complete copy
+    # from the first PDF. Multiple pages of that invoice inside that PDF remain.
+    first_source = result.groupby("invoice")["_upload_file_index"].transform("min")
+    result = result[result["_upload_file_index"].eq(first_source)].copy()
+    return result.drop(columns="_upload_file_index")
+
+
+def merge_new_invoices(existing, uploaded):
+    """Append only invoice numbers that have not already been saved."""
+    existing = existing.copy()
+    uploaded = uploaded.copy()
+    if uploaded.empty:
+        return existing, uploaded, [], 0
+
+    uploaded["invoice"] = uploaded["invoice"].astype(str).str.strip()
+    if existing.empty:
+        accepted = uploaded
+        repeated_ids = []
+    else:
+        existing["invoice"] = existing["invoice"].astype(str).str.strip()
+        existing_ids = set(existing["invoice"].dropna()) - {"", "nan", "None"}
+        uploaded_ids = set(uploaded["invoice"].dropna()) - {"", "nan", "None"}
+        repeated_ids = sorted(uploaded_ids & existing_ids)
+
+        # A repeated copy may include an OC that was missing in the saved copy.
+        # Enrich that field without adding its sales lines again.
+        if repeated_ids and "purchase_order" in uploaded.columns:
+            order_map = (
+                uploaded.loc[
+                    uploaded["invoice"].isin(repeated_ids)
+                    & uploaded["purchase_order"].fillna("").astype(str).str.strip().ne("")
+                ]
+                .drop_duplicates("invoice")
+                .set_index("invoice")["purchase_order"]
+            )
+            if "purchase_order" not in existing.columns:
+                existing["purchase_order"] = ""
+            missing_order = existing["purchase_order"].fillna("").astype(str).str.strip().eq("")
+            existing.loc[missing_order, "purchase_order"] = existing.loc[missing_order, "invoice"].map(order_map).fillna("")
+
+        accepted = uploaded[~uploaded["invoice"].isin(existing_ids)].copy()
+
+    line_key = [column for column in ["invoice", "date", "code", "quantity", "net_sales", "pdf_page"] if column in accepted.columns]
+    duplicate_upload_lines = int(accepted.duplicated(line_key).sum()) if line_key else 0
+    if line_key:
+        accepted = accepted.drop_duplicates(line_key, keep="first")
+    combined = pd.concat([existing, accepted], ignore_index=True)
+    return combined, accepted, repeated_ids, duplicate_upload_lines
+
+
 def profit_sku(value):
     """Normalize profitability SKUs without turning EXP codes into national SKUs."""
     if pd.isna(value):
@@ -382,6 +444,23 @@ def unpack_profit_store(encoded):
 def profitability_lines(invoices, costs):
     clean_costs = costs.drop_duplicates("code", keep=False).copy()
     result = invoices.merge(clean_costs[["code", "cost_product", "unit_cost", "uom"]], on="code", how="left")
+    complete_name = result["cost_product"].fillna("").astype(str).str.strip()
+    result["product"] = complete_name.where(complete_name.ne(""), result["product"])
+    def commercial_customer(value):
+        original = str(value or "Cliente sin identificar").strip()
+        normalized = _plain_header(original).upper()
+        if "DISLUB" in normalized or "EL PINO" in normalized:
+            return "DISLUB / EL PINO"
+        if "FAVORITA" in normalized:
+            return "CORPORACIÓN FAVORITA"
+        if "ROSADO" in normalized:
+            return "CORPORACIÓN EL ROSADO"
+        if re.search(r"\bTIA\b", normalized):
+            return "TÍA"
+        if "GERARDO ORTIZ" in normalized or "CORAL" in normalized:
+            return "CORAL / GERARDO ORTIZ"
+        return original
+    result["customer"] = result["customer"].map(commercial_customer)
     for column in ["quantity", "unit_price", "net_sales", "unit_cost"]:
         result[column] = pd.to_numeric(result[column], errors="coerce")
     result["cost_of_sales"] = result["quantity"] * result["unit_cost"]
@@ -517,7 +596,10 @@ def build_analysis(forecast, stock, invoices, cutoff):
 
 
 def file_signature(file):
-    return None if file is None else (file.name, len(file.getvalue()))
+    if file is None:
+        return None
+    content = file.getvalue()
+    return (file.name, len(content), zlib.crc32(content))
 
 
 def prepare_weekly_order(raw, code_column, quantity_column):
@@ -822,7 +904,7 @@ if "current_weekly_order" not in st.session_state:
 if "storage_command" not in st.session_state:
     st.session_state.storage_command = {"action": "load", "revision": "initial", "payload": ""}
 command = st.session_state.storage_command
-storage_result = browser_store(**command, key="saved_commercial_cut")
+storage_result = browser_store(**command, storage_key="control-comercial-corte-v1", key="saved_commercial_cut")
 if isinstance(storage_result, dict):
     if storage_result.get("action") == "loaded" and not st.session_state.get("storage_loaded"):
         st.session_state.storage_loaded = True
@@ -849,14 +931,27 @@ if "profit_store" not in st.session_state:
 if "profit_storage_command" not in st.session_state:
     st.session_state.profit_storage_command = {"action": "load", "revision": "initial-profit", "payload": ""}
 profit_command = st.session_state.profit_storage_command
-profit_storage_result = browser_store(**profit_command, key="saved_profitability_cuts")
+profit_storage_result = browser_store(
+    **profit_command,
+    storage_key="control-comercial-rentabilidad-v1",
+    fallback_key="control-comercial-corte-v1",
+    key="saved_profitability_cuts",
+)
 if isinstance(profit_storage_result, dict):
     if profit_storage_result.get("action") == "loaded" and not st.session_state.get("profit_storage_loaded"):
         st.session_state.profit_storage_loaded = True
         if profit_storage_result.get("payload"):
             try:
                 st.session_state.profit_store = unpack_profit_store(profit_storage_result["payload"])
-                st.session_state.profit_notice = "Se recuperó el histórico de Rentabilidad guardado en este navegador."
+                if profit_storage_result.get("source") == "fallback":
+                    st.session_state.profit_storage_command = {
+                        "action": "save",
+                        "revision": uuid.uuid4().hex,
+                        "payload": pack_profit_store(st.session_state.profit_store),
+                    }
+                    st.session_state.profit_notice = "Se recuperó Rentabilidad del almacenamiento anterior y se separó del corte comercial."
+                else:
+                    st.session_state.profit_notice = "Se recuperó el histórico de Rentabilidad guardado en este navegador."
             except Exception as exc:
                 st.session_state.profit_notice = f"No pude recuperar Rentabilidad: {exc}"
         st.rerun()
@@ -899,8 +994,11 @@ with st.sidebar:
     generation = st.session_state.upload_generation
     forecast_file = st.file_uploader("Forecast (.xlsx)", type="xlsx", key=f"forecast_{generation}")
     stock_file = st.file_uploader("Stock (.xlsx)", type="xlsx", key=f"stock_{generation}")
-    pdf_file = st.file_uploader("Facturas nuevas (.pdf)", type="pdf", key=f"pdf_{generation}")
-    signature = (file_signature(forecast_file), file_signature(stock_file), file_signature(pdf_file))
+    pdf_files = st.file_uploader(
+        "Facturas nuevas (.pdf)", type="pdf", accept_multiple_files=True, key=f"pdf_{generation}"
+    )
+    st.caption("Puede seleccionar varios PDF a la vez. Las facturas cuyo número ya esté guardado se ignorarán.")
+    signature = (file_signature(forecast_file), file_signature(stock_file), tuple(file_signature(file) for file in pdf_files or []))
     if st.session_state.get("validated_signature") != signature:
         st.session_state.pop("validated_bundle", None)
         st.session_state.pop("validation_summary", None)
@@ -914,13 +1012,12 @@ with st.sidebar:
             else:
                 candidate_stock, candidate_lots = active["stock"].copy(), active["lots"].copy()
 
-            new_invoices = read_pdf(pdf_file) if pdf_file else pd.DataFrame(columns=active["invoices"].columns)
-            # Put the newly parsed copy first so a repeated invoice can enrich an
-            # older saved line with its purchase-order number instead of losing it.
-            combined_invoices = pd.concat([new_invoices, active["invoices"]], ignore_index=True)
-            duplicate_key = ["invoice", "date", "code", "quantity", "net_sales"]
-            duplicated = int(combined_invoices.duplicated(duplicate_key).sum())
-            combined_invoices = combined_invoices.drop_duplicates(duplicate_key, keep="first")
+            parsed_invoices = read_invoice_pdfs(pdf_files)
+            if parsed_invoices.empty:
+                parsed_invoices = pd.DataFrame(columns=active["invoices"].columns)
+            combined_invoices, new_invoices, repeated_invoice_ids, duplicate_upload_lines = merge_new_invoices(
+                active["invoices"], parsed_invoices
+            )
             cutoff_candidate = pd.to_datetime(combined_invoices["date"]).max() if not combined_invoices.empty else pd.NaT
             errors, warnings = validate_bundle(candidate_forecast, candidate_stock, combined_invoices, new_invoices)
 
@@ -928,9 +1025,12 @@ with st.sidebar:
             st.session_state.validation_summary = {
                 "errors": errors,
                 "warnings": warnings,
+                "read_lines": len(parsed_invoices),
+                "read_invoices": int(parsed_invoices["invoice"].nunique()) if not parsed_invoices.empty else 0,
                 "new_lines": len(new_invoices),
                 "new_invoices": int(new_invoices["invoice"].nunique()) if not new_invoices.empty else 0,
-                "duplicates": duplicated,
+                "duplicate_invoices": len(repeated_invoice_ids),
+                "duplicates": duplicate_upload_lines,
                 "date_min": new_invoices["date"].min() if not new_invoices.empty else None,
                 "date_max": new_invoices["date"].max() if not new_invoices.empty else None,
                 "cutoff": cutoff_candidate,
@@ -939,7 +1039,7 @@ with st.sidebar:
                 st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "fill_rate_invoices": active.get("fill_rate_invoices", blank_bundle()["fill_rate_invoices"]).copy(), "orders": active.get("orders", blank_bundle()["orders"]).copy(), "weekly_order": active.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy(), "cutoff": cutoff_candidate}
         except Exception as exc:
             st.session_state.validated_signature = signature
-            st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "new_lines": 0, "new_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None, "cutoff": None}
+            st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "read_lines": 0, "read_invoices": 0, "new_lines": 0, "new_invoices": 0, "duplicate_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None, "cutoff": None}
             st.session_state.pop("validated_bundle", None)
 
     summary = st.session_state.get("validation_summary")
@@ -951,14 +1051,16 @@ with st.sidebar:
         else:
             st.success("Información conforme")
             if summary["new_lines"]:
-                st.write(f"**{summary['new_invoices']}** facturas y **{summary['new_lines']}** líneas leídas.")
+                st.write(f"Se agregarán **{summary['new_invoices']} facturas nuevas** con **{summary['new_lines']} líneas**.")
                 st.write(f"Fechas: **{pd.Timestamp(summary['date_min']).strftime('%d-%b-%Y')}** a **{pd.Timestamp(summary['date_max']).strftime('%d-%b-%Y')}**.")
             else:
                 st.write("No se cargaron facturas nuevas.")
+            if summary.get("duplicate_invoices"):
+                st.info(f"Se ignoraron **{summary['duplicate_invoices']} facturas ya guardadas** porque su número de factura ya existe.")
             if summary.get("cutoff") is not None and not pd.isna(summary["cutoff"]):
                 st.write(f"**Fecha de corte que usará el dashboard: {pd.Timestamp(summary['cutoff']).strftime('%d/%m/%Y')}**")
             if summary["duplicates"]:
-                st.info(f"Se encontraron {summary['duplicates']} líneas ya cargadas. No se duplicarán.")
+                st.info(f"También se ignoraron {summary['duplicates']} líneas idénticas repetidas dentro del archivo.")
             for message in summary["warnings"]:
                 st.warning(message)
 
@@ -1739,23 +1841,28 @@ with tab7:
 
     st.markdown("#### 1. Facturas para conciliar")
     st.caption("Estas facturas se guardan únicamente para el Fill Rate. No cambian las ventas, el forecast ni el stock de las otras pestañas.")
-    fill_rate_pdf = st.file_uploader("Cargar facturas del mes (.pdf)", type="pdf", key="fill_rate_invoice_pdf")
-    if fill_rate_pdf is not None:
+    fill_rate_pdfs = st.file_uploader(
+        "Cargar facturas del mes (.pdf)", type="pdf", accept_multiple_files=True, key="fill_rate_invoice_pdf"
+    )
+    st.caption("Puede cargar varios PDF. El número de factura evita duplicados aunque repita un archivo acumulado.")
+    if fill_rate_pdfs:
         try:
-            parsed_fill_invoices = read_pdf(fill_rate_pdf)
+            parsed_fill_invoices = read_invoice_pdfs(fill_rate_pdfs)
             if parsed_fill_invoices.empty:
-                st.error("No pude leer líneas de producto en este PDF de facturas.")
+                st.error("No pude leer líneas de producto en los PDF seleccionados.")
             else:
                 orders_read = int(parsed_fill_invoices.loc[parsed_fill_invoices["purchase_order"].ne(""), "invoice"].nunique())
                 st.write(f"Se leyeron **{parsed_fill_invoices['invoice'].nunique()} facturas**, **{len(parsed_fill_invoices)} líneas** y **{orders_read} facturas con orden de compra**.")
                 if st.button("Guardar facturas y conciliar", type="primary", key="save_fill_rate_invoices"):
-                    combined_fill_invoices = pd.concat([parsed_fill_invoices, fill_rate_invoice_df], ignore_index=True)
-                    fill_key = ["invoice", "date", "code", "quantity", "net_sales"]
-                    duplicate_fill_lines = int(combined_fill_invoices.duplicated(fill_key).sum())
-                    combined_fill_invoices = combined_fill_invoices.drop_duplicates(fill_key, keep="first")
+                    combined_fill_invoices, accepted_fill_invoices, repeated_fill_ids, duplicate_fill_lines = merge_new_invoices(
+                        fill_rate_invoice_df, parsed_fill_invoices
+                    )
                     st.session_state.active_bundle["fill_rate_invoices"] = combined_fill_invoices
                     st.session_state.storage_command = {"action": "save", "revision": uuid.uuid4().hex, "payload": pack_bundle(st.session_state.active_bundle)}
-                    st.session_state.storage_notice = f"Facturas guardadas para Fill Rate. Se ignoraron {duplicate_fill_lines} líneas repetidas."
+                    st.session_state.storage_notice = (
+                        f"Fill Rate actualizado: {accepted_fill_invoices['invoice'].nunique()} facturas nuevas. "
+                        f"Se ignoraron {len(repeated_fill_ids)} facturas ya guardadas y {duplicate_fill_lines} líneas repetidas."
+                    )
                     st.rerun()
         except Exception as exc:
             st.error(f"No pude leer las facturas para Fill Rate: {exc}")
@@ -1936,7 +2043,7 @@ with tab8:
 
     month_labels = {1:"Enero", 2:"Febrero", 3:"Marzo", 4:"Abril", 5:"Mayo", 6:"Junio", 7:"Julio", 8:"Agosto", 9:"Septiembre", 10:"Octubre", 11:"Noviembre", 12:"Diciembre"}
     now = pd.Timestamp.today()
-    saved_months = sorted(st.session_state.profit_store.get("months", {}).keys(), reverse=True)
+    saved_months = sorted({key.split("::", 1)[0] for key in st.session_state.profit_store.get("months", {})}, reverse=True)
     default_month = f"{now.year:04d}-{now.month:02d}"
     month_options = sorted(set(saved_months + [default_month]), reverse=True)
     selected_month = st.selectbox(
@@ -1945,11 +2052,17 @@ with tab8:
         format_func=lambda key: f"{month_labels[int(key[5:7])]} {key[:4]}",
         key="profit_month",
     )
+    selected_company = st.selectbox(
+        "Empresa / portafolio",
+        ["KARAY / ZICO", "DISLUB / EL PINO"],
+        key="profit_company",
+    )
+    profit_store_key = selected_month if selected_company == "KARAY / ZICO" else f"{selected_month}::DISLUB_EL_PINO"
     month_name = f"{month_labels[int(selected_month[5:7])]} {selected_month[:4]}"
-    saved_cut = st.session_state.profit_store.get("months", {}).get(selected_month, {"invoices": pd.DataFrame(), "costs": pd.DataFrame()})
+    saved_cut = st.session_state.profit_store.get("months", {}).get(profit_store_key, {"invoices": pd.DataFrame(), "costs": pd.DataFrame()})
     saved_profit_invoices = saved_cut.get("invoices", pd.DataFrame()).copy()
     saved_profit_costs = saved_cut.get("costs", pd.DataFrame()).copy()
-    st.markdown(f"**Costos activos: {month_name}**")
+    st.markdown(f"**Costos activos: {month_name} · {selected_company}**")
 
     up1, up2 = st.columns(2)
     with up1:
@@ -1959,7 +2072,7 @@ with tab8:
         profit_cost_file = st.file_uploader("Costos del mes desde Odoo (.xlsx)", type="xlsx", key=f"profit_costs_{selected_month}")
         st.caption("Referencia Interna · Nombre · Costo · Unidad de Medida")
 
-    profit_signature = (selected_month, tuple(file_signature(file) for file in profit_pdfs or []), file_signature(profit_cost_file))
+    profit_signature = (selected_month, selected_company, tuple(file_signature(file) for file in profit_pdfs or []), file_signature(profit_cost_file))
     if st.session_state.get("profit_validated_signature") != profit_signature:
         st.session_state.pop("profit_candidate", None)
         st.session_state.pop("profit_validation", None)
@@ -2011,7 +2124,7 @@ with tab8:
             st.session_state.profit_validated_signature = profit_signature
             st.session_state.profit_validation = {"errors": errors, "warnings": warnings, "missing": missing_cost_codes, "duplicates": duplicate_cost_codes, "zero": zero_cost_codes, "new_invoices": int(new_invoices['invoice'].nunique()) if not new_invoices.empty else 0}
             if not errors:
-                st.session_state.profit_candidate = {"month": selected_month, "invoices": invoice_candidate, "costs": cost_candidate}
+                st.session_state.profit_candidate = {"month": selected_month, "store_key": profit_store_key, "company": selected_company, "invoices": invoice_candidate, "costs": cost_candidate}
         except Exception as exc:
             st.session_state.profit_validation = {"errors": [f"No pude prevalidar Rentabilidad: {exc}"], "warnings": [], "missing": [], "duplicates": [], "zero": [], "new_invoices": 0}
             st.session_state.pop("profit_candidate", None)
@@ -2030,14 +2143,14 @@ with tab8:
 
     if st.button("Guardar / actualizar Rentabilidad", disabled="profit_candidate" not in st.session_state, key="save_profit"):
         candidate = st.session_state.profit_candidate
-        st.session_state.profit_store.setdefault("months", {})[candidate["month"]] = {"invoices": candidate["invoices"], "costs": candidate["costs"]}
+        st.session_state.profit_store.setdefault("months", {})[candidate["store_key"]] = {"invoices": candidate["invoices"], "costs": candidate["costs"]}
         st.session_state.profit_storage_loaded = True
         st.session_state.profit_storage_command = {"action": "save", "revision": uuid.uuid4().hex, "payload": pack_profit_store(st.session_state.profit_store)}
         st.session_state.pop("profit_candidate", None)
         st.session_state.pop("profit_validation", None)
         st.rerun()
 
-    saved_cut = st.session_state.profit_store.get("months", {}).get(selected_month)
+    saved_cut = st.session_state.profit_store.get("months", {}).get(profit_store_key)
     if not saved_cut or saved_cut.get("invoices", pd.DataFrame()).empty or saved_cut.get("costs", pd.DataFrame()).empty:
         st.info("Seleccione el mes, cargue facturas y costos, prevalide y guarde para ver la rentabilidad.")
     else:
@@ -2047,7 +2160,7 @@ with tab8:
         calculated = profitability_lines(month_invoices, month_costs)
         all_codes = calculated["code"].nunique()
         found_codes = calculated.loc[calculated["unit_cost"].notna() & calculated["unit_cost"].gt(0), "code"].nunique()
-        missing_table = calculated[calculated["unit_cost"].isna() | calculated["unit_cost"].le(0)].groupby(["code", "product"], as_index=False).agg(Unidades=("quantity", "sum"), Venta_afectada=("net_sales", "sum"))
+        missing_table = calculated[calculated["unit_cost"].isna() | calculated["unit_cost"].le(0)].groupby("code", as_index=False).agg(Producto=("product", "first"), Unidades=("quantity", "sum"), Venta_afectada=("net_sales", "sum"))
         v1, v2, v3, v4 = st.columns(4)
         v1.metric("SKU facturados", f"{all_codes:,}")
         v2.metric("SKU con costo", f"{found_codes:,}")
@@ -2055,7 +2168,7 @@ with tab8:
         v4.metric("Cobertura de costos", f"{found_codes / all_codes:.1%}" if all_codes else "0,0%")
         if not missing_table.empty:
             st.error("Existen ventas sin costo válido. Estas líneas no entran en utilidad ni margen hasta que se cargue el costo correcto.")
-            st.dataframe(missing_table.rename(columns={"code":"SKU sin costo", "product":"Producto", "Venta_afectada":"Venta afectada"}), hide_index=True, width="stretch", column_config={"Venta afectada": st.column_config.NumberColumn(format="$%,.2f"), "Unidades": st.column_config.NumberColumn(format="%,.2f")})
+            st.dataframe(missing_table.rename(columns={"code":"SKU sin costo", "Venta_afectada":"Venta afectada"}), hide_index=True, width="stretch", column_config={"Venta afectada": st.column_config.NumberColumn(format="$%,.2f"), "Unidades": st.column_config.NumberColumn(format="%,.2f")})
 
         valid = calculated[calculated["unit_cost"].notna() & calculated["unit_cost"].gt(0)].copy()
         if not valid.empty:
@@ -2082,13 +2195,17 @@ with tab8:
 
             net_total, cost_total, profit_total = filtered["net_sales"].sum(), filtered["cost_of_sales"].sum(), filtered["gross_profit"].sum()
             margin_total = profit_total / net_total if net_total else pd.NA
-            sku_base = filtered.groupby(["code", "product", "invoice_type"], as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Venta_lista=("gross_before_discount", "sum"), Descuento_valor=("discount_amount", "sum"), Costo_unitario=("unit_cost", "first"), Costo_vendido=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
-            sku_base["Precio_promedio"] = sku_base["Venta"] / sku_base["Unidades"].replace(0, pd.NA)
-            sku_base["Descuento_promedio"] = sku_base["Descuento_valor"] / sku_base["Venta_lista"].replace(0, pd.NA)
-            sku_base["Margen"] = sku_base["Utilidad"] / sku_base["Venta"].replace(0, pd.NA)
-            sku_base["Semáforo"] = sku_base["Margen"].map(
-                lambda value: "🔴 Pérdida" if value < 0 else "🟠 Crítico" if value <= margin_low / 100 else "🟡 Revisar" if value <= margin_good / 100 else "🟢 Saludable"
-            )
+            def summarize_skus(source):
+                summary = source.groupby(["code", "invoice_type"], as_index=False).agg(product=("product", "first"), Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Venta_lista=("gross_before_discount", "sum"), Descuento_valor=("discount_amount", "sum"), Costo_unitario=("unit_cost", "first"), Costo_vendido=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
+                summary["Precio_promedio"] = summary["Venta"] / summary["Unidades"].replace(0, pd.NA)
+                summary["Descuento_promedio"] = summary["Descuento_valor"] / summary["Venta_lista"].replace(0, pd.NA)
+                summary["Margen"] = summary["Utilidad"] / summary["Venta"].replace(0, pd.NA)
+                summary["Semáforo"] = summary["Margen"].map(
+                    lambda value: "🔴 Pérdida" if value < 0 else "🟠 Crítico" if value <= margin_low / 100 else "🟡 Revisar" if value <= margin_good / 100 else "🟢 Saludable"
+                )
+                return summary
+
+            sku_base = summarize_skus(filtered)
             k1, k2, k3, k4, k5, k6 = st.columns(6)
             k1.metric("Venta neta", f"${net_total:,.2f}")
             k2.metric("Costo de venta", f"${cost_total:,.2f}")
@@ -2099,11 +2216,15 @@ with tab8:
 
             view1, view2, view3, view4 = st.tabs(["Por SKU", "Por cliente", "Cliente × SKU", "Top y Bottom"])
             with view1:
-                sort_col, type_col = st.columns([2, 1])
+                sort_col, type_col, sku_client_col = st.columns([2, 1, 1.5])
                 sort_label = sort_col.selectbox("Ordenar por", ["Venta", "Utilidad", "Margen", "Unidades"], key="profit_sort")
                 sku_type_filter = type_col.selectbox("Mostrar tipo de venta", ["Todos", "Nacional", "Exportación", "Otra"], key="profit_sku_type_filter")
+                sku_client_filter = sku_client_col.selectbox("Cliente", ["Todos"] + sorted(filtered["customer"].dropna().unique().tolist()), key="profit_sku_client_filter")
                 st.caption("Cada SKU aparece separado por tipo de venta. Las filas de exportación se resaltan porque pueden tener un descuento comercial adicional.")
-                sku_view = sku_base if sku_type_filter == "Todos" else sku_base[sku_base["invoice_type"] == sku_type_filter]
+                sku_source = filtered if sku_client_filter == "Todos" else filtered[filtered["customer"] == sku_client_filter]
+                sku_view = summarize_skus(sku_source)
+                if sku_type_filter != "Todos":
+                    sku_view = sku_view[sku_view["invoice_type"] == sku_type_filter]
                 sku_show = sku_view.sort_values(sort_label, ascending=False).rename(columns={"code":"Código", "product":"Producto", "invoice_type":"Tipo de venta", "Precio_promedio":"Precio promedio real", "Descuento_promedio":"Descuento promedio %", "Costo_unitario":"Costo unitario", "Costo_vendido":"Costo vendido $", "Utilidad":"Utilidad bruta $", "Margen":"Margen bruto %", "Venta":"Venta neta $", "Unidades":"Unidades vendidas"})
                 sku_show = sku_show[["Código", "Producto", "Tipo de venta", "Semáforo", "Unidades vendidas", "Venta neta $", "Precio promedio real", "Descuento promedio %", "Costo unitario", "Costo vendido $", "Utilidad bruta $", "Margen bruto %"]]
                 sku_show["Descuento promedio %"] = sku_show["Descuento promedio %"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
@@ -2112,7 +2233,7 @@ with tab8:
                     lambda row: ["background-color: #fff3cd; color: #7a4b00; font-weight: 600"] * len(row) if row["Tipo de venta"] == "Exportación" else [""] * len(row),
                     axis=1,
                 )
-                st.dataframe(styled_sku, hide_index=True, width="stretch", column_config={"Venta neta $":st.column_config.NumberColumn(format="$%,.2f"), "Precio promedio real":st.column_config.NumberColumn(format="$%,.4f"), "Costo unitario":st.column_config.NumberColumn(format="$%,.5f"), "Costo vendido $":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad bruta $":st.column_config.NumberColumn(format="$%,.2f")})
+                st.dataframe(styled_sku, hide_index=True, width="stretch", column_config={"Producto":st.column_config.TextColumn(width="large"), "Venta neta $":st.column_config.NumberColumn(format="$%,.2f"), "Precio promedio real":st.column_config.NumberColumn(format="$%,.4f"), "Costo unitario":st.column_config.NumberColumn(format="$%,.5f"), "Costo vendido $":st.column_config.NumberColumn(format="$%,.2f"), "Utilidad bruta $":st.column_config.NumberColumn(format="$%,.2f")})
             client_base = filtered.groupby("customer", as_index=False).agg(Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"), Unidades=("quantity", "sum"))
             client_base["Margen"] = client_base["Utilidad"] / client_base["Venta"].replace(0, pd.NA)
             with view2:
@@ -2125,7 +2246,7 @@ with tab8:
                 mode = st.radio("Comparar", ["SKU dentro de un cliente", "Un SKU entre clientes"], horizontal=True, key="profit_cross_mode")
                 if mode == "SKU dentro de un cliente":
                     chosen = st.selectbox("Cliente", sorted(filtered["customer"].unique()), key="profit_cross_client")
-                    cross = filtered[filtered["customer"] == chosen].groupby(["code", "product", "invoice_type"], as_index=False).agg(Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
+                    cross = filtered[filtered["customer"] == chosen].groupby(["code", "invoice_type"], as_index=False).agg(product=("product", "first"), Unidades=("quantity", "sum"), Venta=("net_sales", "sum"), Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"))
                 else:
                     sku_choices = sku_base.assign(label=lambda frame: frame["code"] + " · " + frame["product"]).drop_duplicates("label")
                     chosen_label = st.selectbox("SKU", sku_choices["label"].tolist(), key="profit_cross_sku")
