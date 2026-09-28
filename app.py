@@ -212,6 +212,60 @@ def read_stock(file):
     return summary, detail
 
 
+def movement_code(value):
+    """Preserve alphanumeric movement codes so MP materials stay excluded."""
+    if pd.isna(value):
+        return None
+    raw = str(value).strip().upper()
+    bracketed = re.search(r"\[([^\]]+)\]", raw)
+    if bracketed:
+        raw = bracketed.group(1)
+    compact = re.sub(r"[^A-Z0-9]", "", raw)
+    if not compact:
+        return None
+    return compact.zfill(8) if compact.isdigit() and len(compact) <= 8 else compact
+
+
+def read_inventory_movements(file):
+    """Read Odoo stock.move.line exports used by the movement/coverage tab."""
+    raw = pd.read_excel(file, sheet_name=0)
+    normalized = {_plain_header(column): column for column in raw.columns}
+
+    def find(*terms):
+        return next((original for header, original in normalized.items() if all(term in header for term in terms)), None)
+
+    source_col = find("desde") or find("origen")
+    state_col = find("estado")
+    date_col = find("fecha")
+    destination_col = find("hasta") or find("destino")
+    lot_col = find("lote")
+    product_col = find("producto")
+    quantity_col = find("realizado") or find("cantidad")
+    reference_col = find("referencia")
+    uom_col = find("unidad", "medida") or find("udm")
+    required = {"Desde": source_col, "Estado": state_col, "Fecha": date_col, "Hasta": destination_col, "Producto": product_col, "Realizado": quantity_col, "Unidad de medida": uom_col}
+    missing = [label for label, column in required.items() if column is None]
+    if missing:
+        raise ValueError("Faltan columnas en movimientos: " + ", ".join(missing))
+
+    result = pd.DataFrame({
+        "from_location": raw[source_col], "state": raw[state_col], "date": raw[date_col],
+        "to_location": raw[destination_col], "lot": raw[lot_col] if lot_col else "",
+        "product_raw": raw[product_col], "quantity": raw[quantity_col],
+        "reference": raw[reference_col] if reference_col else "", "uom": raw[uom_col],
+    })
+    result["code"] = result["product_raw"].map(movement_code)
+    result["product"] = result["product_raw"].astype(str).str.replace(r"^\s*\[[^\]]+\]\s*", "", regex=True).str.strip()
+    result["date"] = pd.to_datetime(result["date"], errors="coerce")
+    result["quantity"] = pd.to_numeric(result["quantity"], errors="coerce").fillna(0)
+    result["state"] = result["state"].fillna("").astype(str).str.strip()
+    result["from_location"] = result["from_location"].fillna("").astype(str).str.strip()
+    result["to_location"] = result["to_location"].fillna("").astype(str).str.strip()
+    result["uom"] = result["uom"].fillna("").astype(str).str.strip()
+    result = result[result["code"].notna() & result["date"].notna() & result["quantity"].ge(0) & result["state"].str.lower().eq("done")].copy()
+    return result[["code", "product", "date", "from_location", "to_location", "lot", "quantity", "reference", "uom", "state"]].reset_index(drop=True)
+
+
 def read_pdf(file):
     invoice_re = re.compile(r"No\.:\s*(\d{3}-\d{3}-\d{9})")
     issue_date_re = re.compile(r"(?:Fecha de emisi[oó]n:|Issue Date:)\s*(\d{2}/\d{2}/\d{4})", re.I)
@@ -492,14 +546,15 @@ def blank_bundle():
         "fill_rate_invoices": pd.DataFrame(columns=["invoice", "date", "week", "customer", "code", "quantity", "unit_price", "net_sales", "pdf_page", "purchase_order"]),
         "orders": pd.DataFrame(columns=["Cliente", "Orden", "Fecha pedido", "Fecha inicio", "Fecha límite", "Producto en pedido", "Referencia cliente", "Cajas", "Unidades por caja", "Unidades pedidas", "Código SKU", "Archivo", "Revisión"]),
         "weekly_order": pd.DataFrame(columns=["code", "ordered"]),
+        "movements": pd.DataFrame(columns=["code", "product", "date", "from_location", "to_location", "lot", "quantity", "reference", "uom", "state"]),
         "cutoff": pd.NaT,
     }
 
 
 def pack_bundle(bundle):
     data = {
-        "version": 3,
-        "tables": {name: bundle.get(name, blank_bundle()[name]).to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices", "fill_rate_invoices", "orders", "weekly_order"]},
+        "version": 4,
+        "tables": {name: bundle.get(name, blank_bundle()[name]).to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices", "fill_rate_invoices", "orders", "weekly_order", "movements"]},
         "cutoff": None if pd.isna(bundle["cutoff"]) else pd.Timestamp(bundle["cutoff"]).isoformat(),
     }
     return base64.b64encode(zlib.compress(json.dumps(data).encode("utf-8"), level=9)).decode("ascii")
@@ -513,13 +568,13 @@ def unpack_bundle(encoded):
     if len(raw) > 30_000_000 or inflater.unconsumed_tail or not inflater.eof:
         raise ValueError("Copia guardada demasiado grande o dañada")
     data = json.loads(raw)
-    if data.get("version") not in [1, 2, 3]:
+    if data.get("version") not in [1, 2, 3, 4]:
         raise ValueError("Versión de copia no compatible")
     bundle = blank_bundle()
-    for name in ["forecast", "stock", "lots", "invoices", "fill_rate_invoices", "orders", "weekly_order"]:
+    for name in ["forecast", "stock", "lots", "invoices", "fill_rate_invoices", "orders", "weekly_order", "movements"]:
         if name in data["tables"]:
             bundle[name] = pd.read_json(io.StringIO(data["tables"][name]), orient="records", dtype={"code": str}, convert_dates=False)
-    for name, column in [("stock", "expiry"), ("lots", "expiry"), ("invoices", "date"), ("fill_rate_invoices", "date"), ("orders", "Fecha pedido"), ("orders", "Fecha inicio"), ("orders", "Fecha límite")]:
+    for name, column in [("stock", "expiry"), ("lots", "expiry"), ("invoices", "date"), ("fill_rate_invoices", "date"), ("orders", "Fecha pedido"), ("orders", "Fecha inicio"), ("orders", "Fecha límite"), ("movements", "date")]:
         if column in bundle[name]:
             bundle[name][column] = pd.to_datetime(bundle[name][column], errors="coerce")
     bundle["cutoff"] = pd.to_datetime(data["cutoff"]) if data.get("cutoff") else pd.NaT
@@ -994,11 +1049,13 @@ with st.sidebar:
     generation = st.session_state.upload_generation
     forecast_file = st.file_uploader("Forecast (.xlsx)", type="xlsx", key=f"forecast_{generation}")
     stock_file = st.file_uploader("Stock (.xlsx)", type="xlsx", key=f"stock_{generation}")
+    movement_file = st.file_uploader("Movimientos de inventario (.xlsx)", type="xlsx", key=f"movements_{generation}")
+    st.caption("Opcional. Alimenta Movimiento y cobertura y queda guardado con el corte.")
     pdf_files = st.file_uploader(
         "Facturas nuevas (.pdf)", type="pdf", accept_multiple_files=True, key=f"pdf_{generation}"
     )
     st.caption("Puede seleccionar varios PDF a la vez. Las facturas cuyo número ya esté guardado se ignorarán.")
-    signature = (file_signature(forecast_file), file_signature(stock_file), tuple(file_signature(file) for file in pdf_files or []))
+    signature = (file_signature(forecast_file), file_signature(stock_file), file_signature(movement_file), tuple(file_signature(file) for file in pdf_files or []))
     if st.session_state.get("validated_signature") != signature:
         st.session_state.pop("validated_bundle", None)
         st.session_state.pop("validation_summary", None)
@@ -1011,6 +1068,9 @@ with st.sidebar:
                 candidate_stock, candidate_lots = read_stock(stock_file)
             else:
                 candidate_stock, candidate_lots = active["stock"].copy(), active["lots"].copy()
+            candidate_movements = read_inventory_movements(movement_file) if movement_file else active.get("movements", blank_bundle()["movements"]).copy()
+            if movement_file and candidate_movements.empty:
+                raise ValueError("El archivo de movimientos no contiene líneas completadas válidas.")
 
             parsed_invoices = read_invoice_pdfs(pdf_files)
             if parsed_invoices.empty:
@@ -1034,12 +1094,16 @@ with st.sidebar:
                 "date_min": new_invoices["date"].min() if not new_invoices.empty else None,
                 "date_max": new_invoices["date"].max() if not new_invoices.empty else None,
                 "cutoff": cutoff_candidate,
+                "movement_lines": len(candidate_movements),
+                "movement_date_min": candidate_movements["date"].min() if not candidate_movements.empty else None,
+                "movement_date_max": candidate_movements["date"].max() if not candidate_movements.empty else None,
+                "movements_uploaded": movement_file is not None,
             }
             if not errors:
-                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "fill_rate_invoices": active.get("fill_rate_invoices", blank_bundle()["fill_rate_invoices"]).copy(), "orders": active.get("orders", blank_bundle()["orders"]).copy(), "weekly_order": active.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy(), "cutoff": cutoff_candidate}
+                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "fill_rate_invoices": active.get("fill_rate_invoices", blank_bundle()["fill_rate_invoices"]).copy(), "orders": active.get("orders", blank_bundle()["orders"]).copy(), "weekly_order": active.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy(), "movements": candidate_movements, "cutoff": cutoff_candidate}
         except Exception as exc:
             st.session_state.validated_signature = signature
-            st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "read_lines": 0, "read_invoices": 0, "new_lines": 0, "new_invoices": 0, "duplicate_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None, "cutoff": None}
+            st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "read_lines": 0, "read_invoices": 0, "new_lines": 0, "new_invoices": 0, "duplicate_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None, "cutoff": None, "movement_lines": 0, "movement_date_min": None, "movement_date_max": None, "movements_uploaded": False}
             st.session_state.pop("validated_bundle", None)
 
     summary = st.session_state.get("validation_summary")
@@ -1057,6 +1121,8 @@ with st.sidebar:
                 st.write("No se cargaron facturas nuevas.")
             if summary.get("duplicate_invoices"):
                 st.info(f"Se ignoraron **{summary['duplicate_invoices']} facturas ya guardadas** porque su número de factura ya existe.")
+            if summary.get("movements_uploaded"):
+                st.write(f"Se guardarán **{summary['movement_lines']:,} movimientos** de inventario, desde **{pd.Timestamp(summary['movement_date_min']).strftime('%d-%b-%Y')}** hasta **{pd.Timestamp(summary['movement_date_max']).strftime('%d-%b-%Y')}**.")
             if summary.get("cutoff") is not None and not pd.isna(summary["cutoff"]):
                 st.write(f"**Fecha de corte que usará el dashboard: {pd.Timestamp(summary['cutoff']).strftime('%d/%m/%Y')}**")
             if summary["duplicates"]:
@@ -1081,6 +1147,7 @@ lots_df = active["lots"]
 invoice_df = active["invoices"]
 fill_rate_invoice_df = active.get("fill_rate_invoices", blank_bundle()["fill_rate_invoices"])
 orders_df = active.get("orders", blank_bundle()["orders"])
+movement_df = active.get("movements", blank_bundle()["movements"])
 
 if forecast_df.empty or stock_df.empty or invoice_df.empty:
     st.markdown('<div class="hero"><h1>Control comercial</h1><p>Comience un nuevo mes cargando la información.</p></div>', unsafe_allow_html=True)
@@ -1187,7 +1254,7 @@ if sold_forecast / forecast_total > elapsed:
 else:
     st.warning(f"En general vamos atrasados: se vendió {sold_forecast / forecast_total:.1%} del forecast y ha pasado {elapsed:.1%} del mes.")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente", "Pedido semanal", "Fill Rate", "Rentabilidad"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente", "Pedido semanal", "Fill Rate", "Rentabilidad", "Movimiento y cobertura"])
 
 with tab1:
     left, right = st.columns([1, 1])
@@ -2271,5 +2338,147 @@ with tab8:
                 bottom_clients = client_base.nsmallest(10, "Margen")[["customer", "Margen"]].copy()
                 bottom_clients["Margen"] = bottom_clients["Margen"].map(lambda value: f"{value:.1%}" if pd.notna(value) else "—")
                 cbottom.dataframe(bottom_clients, hide_index=True, width="stretch")
+
+with tab9:
+    st.subheader("Movimiento y cobertura de inventario")
+    st.caption("Mide las salidas netas a clientes y estima cuántos días puede cubrir el stock actual. No mezcla transferencias internas, materias primas MP ni unidades de medida diferentes.")
+    if movement_df.empty:
+        st.info("Cargue el Excel **Movimientos de inventario** en el panel izquierdo, pulse **Prevalidar información** y luego **Cargar y actualizar dashboard**.")
+    else:
+        movements = movement_df.copy()
+        movements["date"] = pd.to_datetime(movements["date"], errors="coerce")
+        movements["quantity"] = pd.to_numeric(movements["quantity"], errors="coerce").fillna(0)
+        movements = movements[movements["date"].notna() & ~movements["code"].fillna("").astype(str).str.upper().str.startswith("MP")].copy()
+        movements["is_customer_out"] = movements["to_location"].str.contains("partners/customers", case=False, na=False)
+        movements["is_customer_return"] = movements["from_location"].str.contains("partners/customers", case=False, na=False)
+
+        movement_min = movements["date"].min().date()
+        movement_max = movements["date"].max().date()
+        default_start = max(movement_min, (pd.Timestamp(movement_max) - pd.Timedelta(days=29)).date())
+        f1, f2, f3 = st.columns([1, 1.5, 1.5])
+        uom_options = sorted(value for value in movements["uom"].dropna().unique() if str(value).strip())
+        default_uom_index = uom_options.index("Unidades") if "Unidades" in uom_options else 0
+        selected_uom = f1.selectbox("Unidad de medida", uom_options, index=default_uom_index, key="movement_uom")
+        movement_dates = f2.date_input("Periodo de salidas", value=(default_start, movement_max), min_value=movement_min, max_value=movement_max, key="movement_dates")
+        movement_search = f3.text_input("Buscar SKU o producto", key="movement_search")
+        if isinstance(movement_dates, (tuple, list)) and len(movement_dates) == 2:
+            period_start, period_end = movement_dates
+        else:
+            period_start, period_end = default_start, movement_max
+        period_days = max((period_end - period_start).days + 1, 1)
+
+        selected_movements = movements[movements["uom"].eq(selected_uom) & movements["date"].dt.date.between(period_start, period_end)].copy()
+        outbound = selected_movements[selected_movements["is_customer_out"]].copy()
+        returns = selected_movements[selected_movements["is_customer_return"]].copy()
+        outbound_summary = outbound.groupby("code", as_index=False).agg(Salidas=("quantity", "sum"), Movimientos=("quantity", "size"))
+        return_summary = returns.groupby("code", as_index=False).agg(Devoluciones=("quantity", "sum"))
+        latest_dispatch = movements[movements["uom"].eq(selected_uom) & movements["is_customer_out"] & movements["date"].dt.date.le(period_end)].groupby("code", as_index=False)["date"].max().rename(columns={"date": "Última salida"})
+
+        catalog = pd.concat([forecast_df[["code", "product"]], stock_df[["code", "product"]], movements[["code", "product"]]], ignore_index=True).dropna(subset=["code"])
+        catalog = catalog.drop_duplicates("code", keep="first")
+        movement_codes = set(selected_movements["code"].dropna().astype(str))
+        if selected_uom == "Unidades":
+            movement_codes |= set(stock_df["code"].dropna().astype(str))
+        coverage = catalog[catalog["code"].astype(str).isin(movement_codes)].copy()
+        coverage = coverage.merge(outbound_summary, on="code", how="left").merge(return_summary, on="code", how="left").merge(latest_dispatch, on="code", how="left")
+        coverage[["Salidas", "Devoluciones", "Movimientos"]] = coverage[["Salidas", "Devoluciones", "Movimientos"]].fillna(0)
+        coverage["Salida neta"] = (coverage["Salidas"] - coverage["Devoluciones"]).clip(lower=0)
+        coverage["Promedio diario"] = coverage["Salida neta"] / period_days
+        if selected_uom == "Unidades":
+            stock_current = stock_df[["code", "available"]].copy().rename(columns={"available": "Stock actual"})
+            stock_current["Stock actual"] = pd.to_numeric(stock_current["Stock actual"], errors="coerce")
+            coverage = coverage.merge(stock_current, on="code", how="left")
+            coverage["Cobertura días"] = coverage["Stock actual"] / coverage["Promedio diario"].replace(0, pd.NA)
+        else:
+            coverage["Stock actual"] = pd.NA
+            coverage["Cobertura días"] = pd.NA
+        coverage["Días sin salida"] = (pd.Timestamp(period_end) - pd.to_datetime(coverage["Última salida"], errors="coerce").dt.normalize()).dt.days
+
+        def movement_status(row):
+            if row["Promedio diario"] <= 0:
+                return "⚪ Sin movimiento"
+            if pd.isna(row["Stock actual"]):
+                return "🔵 Stock no comparable"
+            if row["Stock actual"] <= 0:
+                return "🔴 Sin stock"
+            if row["Cobertura días"] <= 7:
+                return "🔴 Cobertura crítica"
+            if row["Cobertura días"] <= 15:
+                return "🟠 Cobertura baja"
+            if row["Cobertura días"] <= 30:
+                return "🟢 Cobertura adecuada"
+            if row["Cobertura días"] <= 60:
+                return "🔵 Cobertura alta"
+            return "🟣 Sobreinventario"
+
+        def movement_action(row):
+            actions = {
+                "⚪ Sin movimiento": "Revisar demanda antes de producir; activar venta si existe stock.",
+                "🔵 Stock no comparable": "Cargar stock en la misma unidad para calcular cobertura.",
+                "🔴 Sin stock": "Programar producción o reposición urgente.",
+                "🔴 Cobertura crítica": "Priorizar producción o reposición.",
+                "🟠 Cobertura baja": "Incluir en el próximo plan de producción.",
+                "🟣 Sobreinventario": "Frenar producción y activar acción comercial.",
+                "🔵 Cobertura alta": "Vigilar rotación y evitar producir de más.",
+            }
+            return actions.get(row["Estado"], "Mantener seguimiento.")
+
+        coverage["Estado"] = coverage.apply(movement_status, axis=1)
+        coverage["Acción"] = coverage.apply(movement_action, axis=1)
+        coverage["Unidad"] = selected_uom
+        coverage = coverage.rename(columns={"code": "Código", "product": "Producto"})
+        if movement_search:
+            coverage = coverage[coverage["Código"].astype(str).str.contains(movement_search, case=False, na=False) | coverage["Producto"].astype(str).str.contains(movement_search, case=False, na=False)]
+        status_options = coverage["Estado"].dropna().unique().tolist()
+        selected_statuses = st.multiselect("Mostrar estados", status_options, default=status_options, key="movement_statuses")
+        if selected_statuses:
+            coverage = coverage[coverage["Estado"].isin(selected_statuses)]
+
+        total_net = coverage["Salida neta"].sum()
+        active_skus = int(coverage["Salida neta"].gt(0).sum())
+        critical_skus = int(coverage["Estado"].isin(["🔴 Sin stock", "🔴 Cobertura crítica"]).sum())
+        no_movement = int((coverage["Estado"].eq("⚪ Sin movimiento") & pd.to_numeric(coverage["Stock actual"], errors="coerce").fillna(0).gt(0)).sum())
+        valid_coverage = pd.to_numeric(coverage["Cobertura días"], errors="coerce").dropna()
+        median_coverage = valid_coverage.median() if not valid_coverage.empty else pd.NA
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Salida neta", f"{total_net:,.0f} {selected_uom.lower()}")
+        m2.metric("SKU con salida", f"{active_skus:,}")
+        m3.metric("Cobertura crítica", f"{critical_skus:,}")
+        m4.metric("Con stock sin salida", f"{no_movement:,}")
+        m5.metric("Cobertura mediana", f"{median_coverage:,.1f} días" if pd.notna(median_coverage) else "—")
+
+        if selected_uom != "Unidades":
+            st.warning("Para esta unidad se muestran movimientos, pero no cobertura: el stock actual está consolidado en unidades y no se harán conversiones automáticas.")
+        st.caption(f"Periodo analizado: {period_start.strftime('%d/%m/%Y')}–{period_end.strftime('%d/%m/%Y')} ({period_days} días). Salida neta = despachos a clientes − devoluciones desde clientes. La cobertura orienta la decisión, pero no reemplaza la revisión del plan de producción.")
+
+        chart_source = coverage[coverage["Salida neta"].gt(0)].nlargest(10, "Salida neta").sort_values("Salida neta")
+        if not chart_source.empty:
+            fig = px.bar(chart_source, x="Salida neta", y="Producto", orientation="h", text_auto=",.0f", title="Top 10 SKU por salida neta a clientes", color_discrete_sequence=["#277da1"])
+            fig.update_layout(showlegend=False, yaxis_title="", xaxis_title=selected_uom)
+            st.plotly_chart(fig, width="stretch")
+
+        movement_show = coverage.sort_values(["Promedio diario", "Stock actual"], ascending=[False, True], na_position="last")[["Código", "Producto", "Unidad", "Stock actual", "Salidas", "Devoluciones", "Salida neta", "Promedio diario", "Cobertura días", "Última salida", "Días sin salida", "Movimientos", "Estado", "Acción"]]
+
+        def color_movement_rows(row):
+            colors = {
+                "🔴 Sin stock": "background-color:#fde2e1;color:#8a1c16;font-weight:600",
+                "🔴 Cobertura crítica": "background-color:#fde2e1;color:#8a1c16;font-weight:600",
+                "🟠 Cobertura baja": "background-color:#fff0dc;color:#8a4b08",
+                "⚪ Sin movimiento": "background-color:#f1f3f5;color:#495057",
+                "🟣 Sobreinventario": "background-color:#efe7fb;color:#5f3b8c",
+            }
+            return [colors.get(row["Estado"], "")] * len(row)
+
+        st.dataframe(movement_show.style.apply(color_movement_rows, axis=1), hide_index=True, width="stretch", column_config={
+            "Producto": st.column_config.TextColumn(width="large"),
+            "Stock actual": st.column_config.NumberColumn(format="%,.0f"),
+            "Salidas": st.column_config.NumberColumn(format="%,.0f"),
+            "Devoluciones": st.column_config.NumberColumn(format="%,.0f"),
+            "Salida neta": st.column_config.NumberColumn(format="%,.0f"),
+            "Promedio diario": st.column_config.NumberColumn(format="%,.1f"),
+            "Cobertura días": st.column_config.NumberColumn(format="%,.1f"),
+            "Última salida": st.column_config.DatetimeColumn(format="DD/MM/YYYY"),
+            "Acción": st.column_config.TextColumn(width="large"),
+        })
 
 st.caption("Regla: el stock usa Cantidad disponible. Va lento si el avance está más de 10 puntos por debajo del tiempo transcurrido; va más rápido si está más de 10 puntos por encima.")
