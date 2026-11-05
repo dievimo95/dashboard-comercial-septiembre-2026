@@ -1096,9 +1096,9 @@ if isinstance(profit_storage_result, dict):
             except Exception as exc:
                 st.session_state.profit_notice = f"No pude recuperar Rentabilidad: {exc}"
         st.rerun()
-    elif profit_storage_result.get("action") == "saved" and profit_storage_result.get("revision") == profit_command["revision"]:
+    elif profit_storage_result.get("action") in ["saved", "cleared"] and profit_storage_result.get("revision") == profit_command["revision"]:
         st.session_state.profit_storage_command = {"action": "load", "revision": profit_command["revision"], "payload": ""}
-        st.session_state.profit_notice = "Rentabilidad guardada en este navegador."
+        st.session_state.profit_notice = "Rentabilidad guardada en este navegador." if profit_storage_result["action"] == "saved" else "Rentabilidad eliminada."
     elif profit_storage_result.get("action") == "error":
         st.session_state.profit_notice = f"No se pudo guardar Rentabilidad: {profit_storage_result.get('message', 'error desconocido')}"
 
@@ -1124,9 +1124,9 @@ if isinstance(close_storage_result, dict):
             except Exception as exc:
                 st.session_state.close_notice = f"No pude recuperar los cierres: {exc}"
         st.rerun()
-    elif close_storage_result.get("action") == "saved" and close_storage_result.get("revision") == close_command["revision"]:
+    elif close_storage_result.get("action") in ["saved", "cleared"] and close_storage_result.get("revision") == close_command["revision"]:
         st.session_state.close_storage_command = {"action": "load", "revision": close_command["revision"], "payload": ""}
-        st.session_state.close_notice = "Cierre mensual guardado en este navegador."
+        st.session_state.close_notice = "Cierre mensual guardado en este navegador." if close_storage_result["action"] == "saved" else "Cierres mensuales eliminados."
     elif close_storage_result.get("action") == "error":
         st.session_state.close_notice = f"No se pudo guardar el cierre: {close_storage_result.get('message', 'error desconocido')}"
 
@@ -1211,6 +1211,39 @@ with st.sidebar:
             st.rerun()
         if cancel_col.button("Cancelar", use_container_width=True):
             st.session_state.pop("reset_pending", None)
+            st.rerun()
+
+    st.divider()
+    if st.button("🗑️ Borrar toda la información", use_container_width=True):
+        st.session_state.reset_all_pending = True
+    if st.session_state.get("reset_all_pending"):
+        st.error(
+            "Se eliminarán el corte comercial, Forecast, stock, facturas, Rentabilidad y todos los cierres guardados en este navegador. "
+            "Los archivos originales de su computadora no se borrarán."
+        )
+        delete_col, keep_col = st.columns(2)
+        if delete_col.button("Sí, borrar todo", type="primary", use_container_width=True):
+            st.session_state.active_bundle = blank_bundle()
+            st.session_state.profit_store = blank_profit_store()
+            st.session_state.close_store = blank_close_store()
+            st.session_state.current_weekly_order = pd.DataFrame(columns=["code", "ordered"])
+            st.session_state.storage_loaded = True
+            st.session_state.profit_storage_loaded = True
+            st.session_state.close_storage_loaded = True
+            st.session_state.storage_command = {"action": "clear", "revision": uuid.uuid4().hex, "payload": ""}
+            st.session_state.profit_storage_command = {"action": "clear", "revision": uuid.uuid4().hex, "payload": ""}
+            st.session_state.close_storage_command = {"action": "clear", "revision": uuid.uuid4().hex, "payload": ""}
+            st.session_state.upload_generation += 1
+            for key in [
+                "validated_bundle", "validation_summary", "validated_signature", "reset_pending", "reset_all_pending",
+                "profit_candidate", "profit_validation", "profit_validated_signature", "profit_risk_view",
+                "current_weekly_order_signature", "selected_close_month",
+            ]:
+                st.session_state.pop(key, None)
+            st.session_state.storage_notice = "Toda la información guardada fue eliminada. Ya puede cargar septiembre y octubre desde cero."
+            st.rerun()
+        if keep_col.button("Cancelar borrado", use_container_width=True):
+            st.session_state.pop("reset_all_pending", None)
             st.rerun()
 
     generation = st.session_state.upload_generation
