@@ -3378,7 +3378,7 @@ with tab10:
                     if "artesanal" in product_key or ean_key.startswith("786122383") or code_key.startswith(("0103", "0203")):
                         return "El Artesanal"
                     if "karay" in product_key or ean_key.startswith("786212351"):
-                        return "Karay"
+                        return "El Pino"
                     return "Marca no identificada"
 
                 result["Marca"] = result.apply(identify_brand, axis=1)
