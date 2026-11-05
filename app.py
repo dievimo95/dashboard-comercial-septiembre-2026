@@ -3369,8 +3369,24 @@ with tab10:
                     EAN=("barcode", lambda values: next((str(value) for value in values if str(value).strip()), "")),
                     **{value_name: ("net_sales", "sum"), unit_name: ("quantity", "sum")},
                 )
+                def identify_brand(row):
+                    product_key = _plain_header(row["Producto"])
+                    code_key = str(row["code"] or "")
+                    ean_key = str(row["EAN"] or "")
+                    if "el pino" in product_key:
+                        return "El Pino"
+                    if "artesanal" in product_key or ean_key.startswith("786122383") or code_key.startswith(("0103", "0203")):
+                        return "El Artesanal"
+                    if "karay" in product_key or ean_key.startswith("786212351"):
+                        return "Karay"
+                    return "Marca no identificada"
+
+                result["Marca"] = result.apply(identify_brand, axis=1)
                 result["Producto"] = result.apply(
-                    lambda row: f"{row['Producto']} · EAN {row['EAN']}" if row["EAN"] else row["Producto"],
+                    lambda row: (
+                        f"{row['Marca']} · {row['Producto']} · EAN {row['EAN']}"
+                        if row["EAN"] else f"{row['Marca']} · {row['Producto']}"
+                    ),
                     axis=1,
                 )
                 return result.drop(columns="EAN")
@@ -3398,6 +3414,9 @@ with tab10:
                 ),
                 axis=1,
             )
+            dislub_product_comparison["Marca"] = dislub_product_comparison["Marca actual"].fillna(
+                dislub_product_comparison["Marca anterior"]
+            ).fillna("Marca no identificada")
             previous_sale_col = f"Venta {previous_pdf_label}"
             current_sale_col = f"Venta {current_pdf_label}"
             previous_units_col = f"Unidades {previous_pdf_label}"
@@ -3453,13 +3472,15 @@ with tab10:
             )
             st.dataframe(
                 dislub_product_comparison[[
-                    "code", "Nombre completo del producto", "Señal", old_bar_col, new_bar_col, difference_col, "Cambio %"
+                    "code", "Marca", "Nombre completo del producto", "Señal",
+                    old_bar_col, new_bar_col, difference_col, "Cambio %"
                 ]].rename(columns={"code": "Código"}),
                 hide_index=True,
                 width="stretch",
                 height=760,
                 column_config={
                     "Código": st.column_config.TextColumn(width="small"),
+                    "Marca": st.column_config.TextColumn(width="medium"),
                     "Nombre completo del producto": st.column_config.TextColumn(width="large"),
                     "Señal": st.column_config.TextColumn(width="medium"),
                     old_bar_col: st.column_config.ProgressColumn(
