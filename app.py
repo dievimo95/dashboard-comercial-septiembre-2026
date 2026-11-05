@@ -3342,8 +3342,17 @@ with tab10:
                 )
 
             def dislub_pdf_products(lines, value_name, unit_name):
+                def longest_product_name(values):
+                    names = [str(value).strip() for value in values.dropna() if str(value).strip()]
+                    if not names:
+                        return "Producto sin descripción"
+                    # The invoice often repeats the SKU in brackets before the
+                    # description. The code already has its own visible column.
+                    cleaned = [re.sub(r"^\s*\[[^\]]+\]\s*", "", name).strip() for name in names]
+                    return max(cleaned, key=len)
+
                 return lines.groupby("code", as_index=False).agg(
-                    Producto=("product", "first"),
+                    Producto=("product", longest_product_name),
                     **{value_name: ("net_sales", "sum"), unit_name: ("quantity", "sum")},
                 )
 
@@ -3359,8 +3368,16 @@ with tab10:
                 how="outer",
                 suffixes=(" anterior", " actual"),
             )
-            dislub_product_comparison["Producto"] = dislub_product_comparison["Producto actual"].fillna(
-                dislub_product_comparison["Producto anterior"]
+            dislub_product_comparison["Nombre completo del producto"] = dislub_product_comparison.apply(
+                lambda row: max(
+                    [
+                        str(value).strip()
+                        for value in [row.get("Producto anterior"), row.get("Producto actual")]
+                        if pd.notna(value) and str(value).strip()
+                    ] or [str(row.get("code", "Producto sin descripción"))],
+                    key=len,
+                ),
+                axis=1,
             )
             previous_sale_col = f"Venta {previous_pdf_label}"
             current_sale_col = f"Venta {current_pdf_label}"
@@ -3417,14 +3434,14 @@ with tab10:
             )
             st.dataframe(
                 dislub_product_comparison[[
-                    "code", "Producto", "Señal", old_bar_col, new_bar_col, difference_col, "Cambio %"
+                    "code", "Nombre completo del producto", "Señal", old_bar_col, new_bar_col, difference_col, "Cambio %"
                 ]].rename(columns={"code": "Código"}),
                 hide_index=True,
                 width="stretch",
                 height=760,
                 column_config={
                     "Código": st.column_config.TextColumn(width="small"),
-                    "Producto": st.column_config.TextColumn(width="large"),
+                    "Nombre completo del producto": st.column_config.TextColumn(width="large"),
                     "Señal": st.column_config.TextColumn(width="medium"),
                     old_bar_col: st.column_config.ProgressColumn(
                         format=dislub_bar_format, min_value=0, max_value=dislub_product_max, width="medium"
