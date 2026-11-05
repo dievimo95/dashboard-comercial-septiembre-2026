@@ -3162,6 +3162,10 @@ with tab10:
     )
     st.info("Los archivos cargados aquí pertenecen únicamente a DISLUB. Los cierres y archivos de ZICO no se modifican.")
 
+    def dislub_month_label(month_key):
+        period_value = pd.Period(month_key, freq="M")
+        return f"{close_month_names[period_value.month]} {period_value.year}"
+
     dislub_left, dislub_right = st.columns(2)
     with dislub_left:
         st.markdown("### 1️⃣ Mes anterior")
@@ -3174,6 +3178,15 @@ with tab10:
         )
         if dislub_previous_file:
             st.success(f"✅ Recibido: {dislub_previous_file.name}")
+        dislub_previous_pdfs = st.file_uploader(
+            "Facturas PDF del mes anterior",
+            type="pdf",
+            accept_multiple_files=True,
+            key=f"dislub_previous_pdfs_{st.session_state.upload_generation}",
+            help="Puede seleccionar varias facturas PDF al mismo tiempo.",
+        )
+        if dislub_previous_pdfs:
+            st.success(f"✅ {len(dislub_previous_pdfs):,} PDF recibidos")
 
     with dislub_right:
         st.markdown("### 2️⃣ Mes actual")
@@ -3186,6 +3199,15 @@ with tab10:
         )
         if dislub_current_file:
             st.success(f"✅ Recibido: {dislub_current_file.name}")
+        dislub_current_pdfs = st.file_uploader(
+            "Facturas PDF del mes actual",
+            type="pdf",
+            accept_multiple_files=True,
+            key=f"dislub_current_pdfs_{st.session_state.upload_generation}",
+            help="Puede seleccionar varias facturas PDF al mismo tiempo.",
+        )
+        if dislub_current_pdfs:
+            st.success(f"✅ {len(dislub_current_pdfs):,} PDF recibidos")
 
     if dislub_previous_file and dislub_current_file:
         try:
@@ -3198,10 +3220,6 @@ with tab10:
             current_name, current_dislub = dislub_cuts[1]
             if previous_dislub["month"] == current_dislub["month"]:
                 raise ValueError("Los dos archivos corresponden al mismo mes.")
-
-            def dislub_month_label(month_key):
-                period_value = pd.Period(month_key, freq="M")
-                return f"{close_month_names[period_value.month]} {period_value.year}"
 
             previous_dislub_label = dislub_month_label(previous_dislub["month"])
             current_dislub_label = dislub_month_label(current_dislub["month"])
@@ -3287,5 +3305,144 @@ with tab10:
             st.error(f"No pude construir el cierre de DISLUB: {exc}")
     else:
         st.warning("Cargue los dos archivos para comenzar la comparación mensual de DISLUB.")
+
+    st.divider()
+    st.markdown("### 4. Comparación de productos desde las facturas PDF")
+    if dislub_previous_pdfs and dislub_current_pdfs:
+        try:
+            dislub_pdf_cuts = []
+            for source_label, pdf_files in [
+                ("recuadro izquierdo", dislub_previous_pdfs),
+                ("recuadro derecho", dislub_current_pdfs),
+            ]:
+                pdf_lines = read_profitability_pdfs(pdf_files)
+                if pdf_lines.empty:
+                    raise ValueError(f"No pude leer líneas de productos en el {source_label}.")
+                pdf_lines["date"] = pd.to_datetime(pdf_lines["date"], errors="coerce")
+                pdf_months = sorted(pdf_lines["date"].dropna().dt.to_period("M").astype(str).unique())
+                if len(pdf_months) != 1:
+                    raise ValueError(
+                        f"Las facturas del {source_label} deben pertenecer a un solo mes. "
+                        f"Se encontraron: {', '.join(pdf_months) or 'sin fecha'}"
+                    )
+                dislub_pdf_cuts.append((pdf_months[0], source_label, pdf_lines))
+
+            dislub_pdf_cuts.sort(key=lambda item: item[0])
+            previous_pdf_month, previous_pdf_source, previous_pdf_lines = dislub_pdf_cuts[0]
+            current_pdf_month, current_pdf_source, current_pdf_lines = dislub_pdf_cuts[1]
+            if previous_pdf_month == current_pdf_month:
+                raise ValueError("Los dos grupos de PDF corresponden al mismo mes.")
+
+            previous_pdf_label = dislub_month_label(previous_pdf_month)
+            current_pdf_label = dislub_month_label(current_pdf_month)
+            if previous_pdf_source != "recuadro izquierdo":
+                st.warning(
+                    f"Los PDF estaban en orden inverso. Los organicé automáticamente: "
+                    f"{previous_pdf_label} primero y {current_pdf_label} después."
+                )
+
+            def dislub_pdf_products(lines, value_name, unit_name):
+                return lines.groupby("code", as_index=False).agg(
+                    Producto=("product", "first"),
+                    **{value_name: ("net_sales", "sum"), unit_name: ("quantity", "sum")},
+                )
+
+            previous_pdf_products = dislub_pdf_products(
+                previous_pdf_lines, f"Venta {previous_pdf_label}", f"Unidades {previous_pdf_label}"
+            )
+            current_pdf_products = dislub_pdf_products(
+                current_pdf_lines, f"Venta {current_pdf_label}", f"Unidades {current_pdf_label}"
+            )
+            dislub_product_comparison = previous_pdf_products.merge(
+                current_pdf_products,
+                on="code",
+                how="outer",
+                suffixes=(" anterior", " actual"),
+            )
+            dislub_product_comparison["Producto"] = dislub_product_comparison["Producto actual"].fillna(
+                dislub_product_comparison["Producto anterior"]
+            )
+            previous_sale_col = f"Venta {previous_pdf_label}"
+            current_sale_col = f"Venta {current_pdf_label}"
+            previous_units_col = f"Unidades {previous_pdf_label}"
+            current_units_col = f"Unidades {current_pdf_label}"
+            for column in [previous_sale_col, current_sale_col, previous_units_col, current_units_col]:
+                dislub_product_comparison[column] = pd.to_numeric(
+                    dislub_product_comparison[column], errors="coerce"
+                ).fillna(0)
+            dislub_product_comparison["Diferencia $"] = (
+                dislub_product_comparison[current_sale_col] - dislub_product_comparison[previous_sale_col]
+            )
+            dislub_product_comparison["Cambio %"] = (
+                dislub_product_comparison["Diferencia $"]
+                / dislub_product_comparison[previous_sale_col].replace(0, pd.NA)
+            )
+
+            def dislub_product_signal(row):
+                if row[previous_sale_col] <= 0 and row[current_sale_col] > 0:
+                    return "🆕 Nuevo"
+                if row[previous_sale_col] > 0 and row[current_sale_col] <= 0:
+                    return "⏸️ Sin venta"
+                if abs(row["Diferencia $"]) < .01:
+                    return "🟡 Igual"
+                return "🟢 Creció" if row["Diferencia $"] > 0 else "🔴 Bajó"
+
+            dislub_product_comparison["Señal"] = dislub_product_comparison.apply(dislub_product_signal, axis=1)
+            dislub_product_comparison = dislub_product_comparison.sort_values(current_sale_col, ascending=False)
+            dislub_product_metrics = st.columns(3)
+            dislub_product_metrics[0].metric("SKU del mes anterior", f"{previous_pdf_products['code'].nunique():,}")
+            dislub_product_metrics[1].metric("SKU del mes actual", f"{current_pdf_products['code'].nunique():,}")
+            dislub_product_metrics[2].metric("SKU distintos", f"{dislub_product_comparison['code'].nunique():,}")
+
+            dislub_product_measure = st.radio(
+                "Comparar productos por",
+                ["Venta en dólares", "Unidades"],
+                horizontal=True,
+                key="dislub_product_measure",
+            )
+            if dislub_product_measure == "Venta en dólares":
+                old_bar_col, new_bar_col = previous_sale_col, current_sale_col
+                difference_col = "Diferencia $"
+                dislub_bar_format = "$%,.2f"
+            else:
+                old_bar_col, new_bar_col = previous_units_col, current_units_col
+                difference_col = "Diferencia unidades"
+                dislub_product_comparison[difference_col] = (
+                    dislub_product_comparison[current_units_col] - dislub_product_comparison[previous_units_col]
+                )
+                dislub_bar_format = "%,.0f"
+            dislub_product_max = max(
+                1.0,
+                float(dislub_product_comparison[[old_bar_col, new_bar_col]].max().max()),
+            )
+            st.dataframe(
+                dislub_product_comparison[[
+                    "code", "Producto", "Señal", old_bar_col, new_bar_col, difference_col, "Cambio %"
+                ]].rename(columns={"code": "Código"}),
+                hide_index=True,
+                width="stretch",
+                height=760,
+                column_config={
+                    "Código": st.column_config.TextColumn(width="small"),
+                    "Producto": st.column_config.TextColumn(width="large"),
+                    "Señal": st.column_config.TextColumn(width="medium"),
+                    old_bar_col: st.column_config.ProgressColumn(
+                        format=dislub_bar_format, min_value=0, max_value=dislub_product_max, width="medium"
+                    ),
+                    new_bar_col: st.column_config.ProgressColumn(
+                        format=dislub_bar_format, min_value=0, max_value=dislub_product_max, width="medium"
+                    ),
+                    difference_col: st.column_config.NumberColumn(
+                        format="$%,.2f" if dislub_product_measure == "Venta en dólares" else "%+,.0f"
+                    ),
+                    "Cambio %": st.column_config.NumberColumn(format="%.1%%"),
+                },
+            )
+        except Exception as exc:
+            st.error(f"No pude comparar los productos de los PDF: {exc}")
+    elif dislub_previous_pdfs or dislub_current_pdfs:
+        st.warning("Falta cargar las facturas PDF del otro mes.")
+    else:
+        st.info("Cargue las facturas PDF de ambos meses para comparar productos y unidades.")
 
 st.caption("Regla: el stock usa Cantidad disponible. Va lento si el avance está más de 10 puntos por debajo del tiempo transcurrido; va más rápido si está más de 10 puntos por encima.")
