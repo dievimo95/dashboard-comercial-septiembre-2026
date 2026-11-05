@@ -546,18 +546,29 @@ def read_profitability_pdfs(files):
                         if ("Nombres y apellidos:" in line or "Partner:" in line) and idx + 1 < len(lines):
                             customer = re.split(r"\s+(?:Fecha de vencimiento:|Due Date:)", lines[idx + 1])[0].strip()
                             break
-                for line_no, raw_line in enumerate(text.splitlines(), 1):
+                page_lines = text.splitlines()
+                for line_no, raw_line in enumerate(page_lines, 1):
                     match = spanish.match(raw_line.strip()) or english.match(raw_line.strip())
                     if not match or not invoice or not date:
                         continue
                     code, product, qty_raw, price_raw, net_raw = match.groups()
+                    barcode = ""
+                    # DISLUB invoices print the EAN on the line immediately
+                    # after the short product description. It is the reliable
+                    # identifier when several yogurts share a similar name.
+                    for following_line in page_lines[line_no:line_no + 3]:
+                        barcode_match = re.match(r"^\s*(\d{13})\b", following_line)
+                        if barcode_match:
+                            barcode = barcode_match.group(1)
+                            break
                     qty, price, net = number_local(qty_raw), number_local(price_raw), number_local(net_raw)
                     sign = -1 if credit else 1
                     gross = abs(qty * price)
                     discount = max(0.0, (1 - abs(net) / gross) * 100) if gross else 0.0
                     rows.append({
                         "date": pd.Timestamp(date), "invoice": invoice, "customer": customer or "Cliente sin identificar",
-                        "code": profit_sku(code), "product": product.strip(), "quantity": sign * abs(qty),
+                        "code": profit_sku(code), "product": product.strip(), "barcode": barcode,
+                        "quantity": sign * abs(qty),
                         "unit_price": price, "discount_pct": discount, "net_sales": sign * abs(net),
                         "document_type": "Nota de crédito" if credit else "Factura", "pdf_page": page_no,
                         "line_no": line_no, "invoice_type": "Exportación" if invoice.startswith("001-901-") else "Nacional" if invoice.startswith("001-100-") else "Otra",
@@ -3351,10 +3362,18 @@ with tab10:
                     cleaned = [re.sub(r"^\s*\[[^\]]+\]\s*", "", name).strip() for name in names]
                     return max(cleaned, key=len)
 
-                return lines.groupby("code", as_index=False).agg(
+                if "barcode" not in lines:
+                    lines = lines.assign(barcode="")
+                result = lines.groupby("code", as_index=False).agg(
                     Producto=("product", longest_product_name),
+                    EAN=("barcode", lambda values: next((str(value) for value in values if str(value).strip()), "")),
                     **{value_name: ("net_sales", "sum"), unit_name: ("quantity", "sum")},
                 )
+                result["Producto"] = result.apply(
+                    lambda row: f"{row['Producto']} · EAN {row['EAN']}" if row["EAN"] else row["Producto"],
+                    axis=1,
+                )
+                return result.drop(columns="EAN")
 
             previous_pdf_products = dislub_pdf_products(
                 previous_pdf_lines, f"Venta {previous_pdf_label}", f"Unidades {previous_pdf_label}"
