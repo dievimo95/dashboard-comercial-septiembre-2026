@@ -3017,37 +3017,39 @@ with tab9:
                 f"Mostrando {page_start + 1}–{page_end} de {product_count} productos. "
                 "Cambie de grupo para revisar los siguientes; ninguno queda fuera de la tabla."
             )
-            chart_data = chart_products[["Producto", old_column, new_column]].rename(
-                columns={old_column: previous_label, new_column: current_label}
-            ).melt(id_vars="Producto", var_name="Mes", value_name="Valor")
-            comparison_product_fig = px.bar(
-                chart_data,
-                x="Valor",
-                y="Producto",
-                color="Mes",
-                orientation="h",
-                barmode="group",
-                color_discrete_sequence=["#9fbad0", "#20639b"],
-                text_auto=".3s",
+            selected_difference = "Diferencia $" if compare_measure == "Venta en dólares" else "Diferencia unidades"
+            bar_products = chart_products[["code", "Producto", "Señal", old_column, new_column]].copy()
+            bar_products[selected_difference] = bar_products[new_column] - bar_products[old_column]
+            bar_products = bar_products.rename(columns={
+                "code": "Código",
+                old_column: previous_label,
+                new_column: current_label,
+            })
+            bar_max = max(
+                1.0,
+                float(bar_products[[previous_label, current_label]].max().max()) if not bar_products.empty else 1.0,
             )
-            comparison_product_fig.update_layout(
-                title=f"{previous_label} frente a {current_label}",
-                xaxis_title=compare_measure,
-                yaxis_title="",
-                height=max(680, 54 * chart_products["Producto"].nunique()),
-                margin={"l": 360, "r": 45, "t": 75, "b": 70},
-                font={"size": 14},
-                legend={"orientation": "h", "yanchor": "bottom", "y": 1.01, "xanchor": "right", "x": 1},
-                yaxis={"categoryorder":"total ascending", "automargin": True, "tickfont": {"size": 13}},
-                xaxis={"automargin": True, "tickfont": {"size": 13}},
-                bargap=.22,
-            )
-            comparison_product_fig.update_traces(textposition="inside", insidetextanchor="middle")
-            st.caption("💡 Pase el cursor para ver el valor exacto o use el botón de pantalla completa en la esquina del gráfico.")
-            st.plotly_chart(
-                comparison_product_fig,
+            value_format = "$%,.2f" if compare_measure == "Venta en dólares" else "%,.0f"
+            difference_format = "$%,.2f" if compare_measure == "Venta en dólares" else "%+,.0f"
+            st.markdown(f"#### 📊 {previous_label} frente a {current_label}")
+            st.caption("Cada fila es un producto. Las dos barras usan la misma escala para que la comparación sea directa.")
+            st.dataframe(
+                bar_products,
+                hide_index=True,
                 width="stretch",
-                config={"displaylogo": False, "scrollZoom": True, "responsive": True},
+                height=515,
+                column_config={
+                    "Código": st.column_config.TextColumn(width="small"),
+                    "Producto": st.column_config.TextColumn(width="large"),
+                    "Señal": st.column_config.TextColumn(width="medium"),
+                    previous_label: st.column_config.ProgressColumn(
+                        previous_label, format=value_format, min_value=0, max_value=bar_max, width="medium"
+                    ),
+                    current_label: st.column_config.ProgressColumn(
+                        current_label, format=value_format, min_value=0, max_value=bar_max, width="medium"
+                    ),
+                    selected_difference: st.column_config.NumberColumn(format=difference_format, width="small"),
+                },
             )
 
             st.markdown("#### 📋 Tabla completa de productos")
