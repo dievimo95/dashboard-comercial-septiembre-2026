@@ -1521,7 +1521,7 @@ else:
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente",
-    "Pedido semanal", "Fill Rate", "Rentabilidad", "Cierre de mes", "Cierre DISLUB",
+    "Pedido semanal", "Fill Rate", "Rentabilidad", "Cierre de mes ZICO", "Cierre de mes DISLUB",
 ])
 
 with tab1:
@@ -2677,7 +2677,7 @@ with tab8:
 
 with tab9:
     st.markdown(
-        '<div class="close-title"><h2>🧾 Cierre de mes</h2><p>La historia sencilla del mes: cuánto vendimos, cuánto ganamos y qué debemos mejorar.</p></div>',
+        '<div class="close-title"><h2>🧾 Cierre de mes ZICO</h2><p>La historia sencilla del mes: cuánto vendimos, cuánto ganamos y qué debemos mejorar.</p></div>',
         unsafe_allow_html=True,
     )
     if st.session_state.get("close_notice"):
@@ -3098,7 +3098,7 @@ with tab9:
 
 with tab10:
     st.markdown(
-        '<div class="close-title"><h2>🚚 Cierre mensual DISLUB</h2><p>Compare dos meses de DISLUB sin mezclar esta información con el cierre de ZICO.</p></div>',
+        '<div class="close-title"><h2>🚚 Cierre de mes DISLUB</h2><p>Compare dos meses de DISLUB sin mezclar esta información con el cierre de ZICO.</p></div>',
         unsafe_allow_html=True,
     )
     st.info("Los archivos cargados aquí pertenecen únicamente a DISLUB. Los cierres y archivos de ZICO no se modifican.")
