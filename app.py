@@ -1,6 +1,5 @@
 import io
 import json
-import math
 import re
 import base64
 import uuid
@@ -2995,27 +2994,11 @@ with tab9:
             ranked_products = visible_comparison.assign(
                 Total=lambda frame: frame[[old_column, new_column]].max(axis=1)
             ).sort_values("Total", ascending=False)
-            # Keep every SKU available, but show a readable group at a time.
-            # The complete list remains in the table directly below.
-            products_per_page = 12
             product_count = len(ranked_products)
-            page_count = max(1, int(math.ceil(product_count / products_per_page)))
-            page_col, page_note_col = st.columns([1, 2])
-            product_page = page_col.selectbox(
-                "Grupo de productos",
-                list(range(1, page_count + 1)),
-                format_func=lambda page: (
-                    f"Grupo {page} · productos {(page - 1) * products_per_page + 1}–"
-                    f"{min(page * products_per_page, product_count)}"
-                ),
-                key=f"close_product_page_v2_{selected_close_month}_{compare_measure}",
-            )
-            page_start = (product_page - 1) * products_per_page
-            page_end = min(page_start + products_per_page, product_count)
-            chart_products = ranked_products.iloc[page_start:page_end]
-            page_note_col.info(
-                f"Mostrando {page_start + 1}–{page_end} de {product_count} productos. "
-                "Cambie de grupo para revisar los siguientes; ninguno queda fuera de la tabla."
+            chart_products = ranked_products
+            st.info(
+                f"Mostrando los {product_count} productos reconocidos en septiembre u octubre. "
+                "Desplácese dentro de la tabla para revisarlos todos."
             )
             selected_difference = "Diferencia $" if compare_measure == "Venta en dólares" else "Diferencia unidades"
             bar_products = chart_products[["code", "Producto", "Señal", old_column, new_column]].copy()
@@ -3037,7 +3020,7 @@ with tab9:
                 bar_products,
                 hide_index=True,
                 width="stretch",
-                height=515,
+                height=760,
                 column_config={
                     "Código": st.column_config.TextColumn(width="small"),
                     "Producto": st.column_config.TextColumn(width="large"),
