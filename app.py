@@ -37,6 +37,23 @@ COLORS = {
     "Sin movimiento": "#adb5bd",
 }
 
+# Commercial budgets supplied for ZICO. They let an older profitability cut
+# become a complete month-end snapshot without asking for the target again.
+DEFAULT_MONTHLY_BUDGETS = {
+    "2026-01": 334140.61,
+    "2026-02": 311711.17,
+    "2026-03": 325099.93,
+    "2026-04": 331560.66,
+    "2026-05": 339589.94,
+    "2026-06": 387674.24,
+    "2026-07": 396449.47,
+    "2026-08": 370500.32,
+    "2026-09": 392949.80,
+    "2026-10": 436796.21,
+    "2026-11": 379570.63,
+    "2026-12": 399995.34,
+}
+
 st.markdown(
     """
     <style>
@@ -1109,6 +1126,46 @@ if isinstance(close_storage_result, dict):
         st.session_state.close_notice = "Cierre mensual guardado en este navegador."
     elif close_storage_result.get("action") == "error":
         st.session_state.close_notice = f"No se pudo guardar el cierre: {close_storage_result.get('message', 'error desconocido')}"
+
+# Automatically preserve completed historical months found in Rentabilidad.
+# The active month remains a live draft until the user explicitly closes it.
+if st.session_state.get("profit_storage_loaded") and st.session_state.get("close_storage_loaded"):
+    active_cutoff = st.session_state.active_bundle.get("cutoff", pd.NaT)
+    active_period = (
+        pd.Timestamp(active_cutoff).to_period("M")
+        if not pd.isna(active_cutoff)
+        else pd.Timestamp.today().to_period("M")
+    )
+    auto_registered = []
+    for history_key, history_cut in st.session_state.profit_store.get("months", {}).items():
+        if "::" in history_key:
+            continue
+        try:
+            history_period = pd.Period(history_key, freq="M")
+        except (TypeError, ValueError):
+            continue
+        if history_period >= active_period or history_key in st.session_state.close_store.get("months", {}):
+            continue
+        history_invoices = history_cut.get("invoices", pd.DataFrame())
+        history_costs = history_cut.get("costs", pd.DataFrame())
+        history_snapshot = build_close_snapshot(
+            history_key,
+            DEFAULT_MONTHLY_BUDGETS.get(history_key, 0),
+            history_invoices,
+            history_costs,
+        )
+        if history_snapshot:
+            st.session_state.close_store.setdefault("months", {})[history_key] = history_snapshot
+            auto_registered.append(history_key)
+    if auto_registered:
+        st.session_state.close_storage_command = {
+            "action": "save",
+            "revision": uuid.uuid4().hex,
+            "payload": pack_close_store(st.session_state.close_store),
+        }
+        month_list = ", ".join(auto_registered)
+        st.session_state.close_notice = f"Se registraron automáticamente los cierres anteriores: {month_list}."
+        st.rerun()
 
 with st.sidebar:
     st.header("Actualizar información")
@@ -2516,7 +2573,7 @@ with tab9:
 
     if is_live_month:
         setup_left, setup_right = st.columns([2, 1])
-        budget_default = float((saved_snapshot or {}).get("budget", 0))
+        budget_default = float((saved_snapshot or {}).get("budget", DEFAULT_MONTHLY_BUDGETS.get(selected_close_month, 0)))
         monthly_budget = setup_left.number_input(
             "🎯 Presupuesto de venta del mes ($)",
             min_value=0.0,
