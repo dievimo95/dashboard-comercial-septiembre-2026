@@ -371,6 +371,77 @@ def _plain_header(value):
     return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
+def read_account_move_close(file):
+    """Read an Odoo account.move export as month-close invoice headers."""
+    raw = pd.read_excel(file)
+    columns = {_plain_header(column): column for column in raw.columns}
+
+    def find(*terms):
+        return next((original for normalized, original in columns.items() if all(term in normalized for term in terms)), None)
+
+    date_col = find("fecha", "factura")
+    number_col = find("numero")
+    state_col = find("estado")
+    base_col = find("base", "imponible", "firmado")
+    customer_col = find("nombre", "empresa", "mostrar", "factura")
+    missing = [label for label, value in [
+        ("Fecha de factura", date_col), ("Número", number_col), ("Estado", state_col),
+        ("Base imponible firmado", base_col), ("Cliente", customer_col),
+    ] if value is None]
+    if missing:
+        raise ValueError("Faltan columnas del reporte de asientos: " + ", ".join(missing))
+
+    working = raw[[date_col, number_col, state_col, base_col, customer_col]].copy()
+    working.columns = ["date", "invoice", "state", "net_sales", "customer"]
+    working["date"] = pd.to_datetime(working["date"], errors="coerce")
+    working["net_sales"] = pd.to_numeric(working["net_sales"], errors="coerce")
+    working["invoice"] = working["invoice"].fillna("").astype(str).str.strip()
+    working["customer"] = working["customer"].fillna("Cliente sin identificar").astype(str).str.strip()
+    working["state_key"] = working["state"].map(_plain_header)
+    working = working[working["date"].notna() & working["net_sales"].notna() & working["invoice"].ne("")].copy()
+    if working.empty:
+        raise ValueError("El archivo no contiene asientos con fecha, número y base imponible válidos.")
+
+    months = sorted(working["date"].dt.to_period("M").astype(str).unique())
+    if len(months) != 1:
+        raise ValueError("El archivo debe contener un solo mes. Se encontraron: " + ", ".join(months))
+
+    cancelled = working[working["state_key"].str.contains("cancel", na=False)].copy()
+    published = working[working["state_key"].isin(["publicado", "posted"])].copy()
+    if published.empty:
+        raise ValueError("No encontré documentos con estado Publicado.")
+
+    dislub = published["customer"].map(_plain_header).eq("dislub cia ltda")
+    commercial = published[~dislub].copy()
+    commercial["document_type"] = commercial.apply(
+        lambda row: "Nota de crédito" if float(row["net_sales"]) < 0 or "nota" in _plain_header(row["invoice"]) else "Factura",
+        axis=1,
+    )
+    commercial["invoice_type"] = commercial["invoice"].map(
+        lambda value: "Exportación" if "001-901-" in value else "Nacional" if "001-100-" in value else "Otra"
+    )
+    commercial["code"] = "SIN-DETALLE"
+    commercial["product"] = "Archivo de asientos (sin detalle por producto)"
+    commercial["quantity"] = 0.0
+    commercial.loc[commercial["document_type"].eq("Nota de crédito"), "net_sales"] = -commercial.loc[
+        commercial["document_type"].eq("Nota de crédito"), "net_sales"
+    ].abs()
+    lines = commercial[[
+        "date", "invoice", "customer", "code", "product", "quantity", "net_sales", "document_type", "invoice_type"
+    ]].reset_index(drop=True)
+    summary = {
+        "month": months[0],
+        "published": int(len(published)),
+        "commercial": int(len(commercial)),
+        "cancelled": int(len(cancelled)),
+        "excluded_dislub": float(published.loc[dislub, "net_sales"].sum()),
+        "commercial_total": float(lines["net_sales"].sum()),
+        "date_min": working["date"].min(),
+        "date_max": working["date"].max(),
+    }
+    return lines, summary
+
+
 def read_profitability_costs(file):
     raw = pd.read_excel(file, dtype=str)
     columns = {_plain_header(column): column for column in raw.columns}
@@ -546,7 +617,9 @@ def build_close_snapshot(month_key, budget, invoice_lines, cost_lines=None):
         critical_skus = int(((sku_profit["Margen"] >= 0) & (sku_profit["Margen"] <= .15)).sum())
         loss_skus = int((sku_profit["Margen"] < 0).sum())
 
-    top_source = valid_profit if not valid_profit.empty else invoices
+    # Sales and product comparisons must include every invoiced line. Cost
+    # coverage only affects profitability metrics, never whether a SKU appears.
+    top_source = invoices
     customer_top = (
         top_source.groupby("customer", as_index=False)["net_sales"].sum()
         .nlargest(6, "net_sales").rename(columns={"customer": "name", "net_sales": "value"})
@@ -2607,10 +2680,43 @@ with tab9:
     if st.session_state.get("close_notice"):
         st.info(st.session_state.pop("close_notice"))
 
+    st.markdown("**📥 Cargar ventas del cierre desde Odoo**")
+    st.caption(
+        "Puede cargar el Excel de Asiento contable (account.move). Primero lo revisamos; "
+        "no reemplaza ningún cierre guardado hasta que pulse “Guardar este cierre”."
+    )
+    close_move_file = st.file_uploader(
+        "Asientos contables del mes (.xlsx)",
+        type="xlsx",
+        key=f"close_account_move_{st.session_state.upload_generation}",
+        help="Use un archivo que contenga solamente un mes.",
+    )
+    uploaded_close_lines, uploaded_close_summary = None, None
+    if close_move_file:
+        try:
+            uploaded_close_lines, uploaded_close_summary = read_account_move_close(close_move_file)
+            summary = uploaded_close_summary
+            st.success(
+                f"Archivo listo: {summary['commercial']:,} documentos comerciales publicados · "
+                f"venta comercial ${summary['commercial_total']:,.2f}."
+            )
+            check_cols = st.columns(4)
+            check_cols[0].metric("Mes detectado", pd.Period(summary["month"], freq="M").strftime("%B %Y").capitalize())
+            check_cols[1].metric("Publicados", f"{summary['published']:,}")
+            check_cols[2].metric("Cancelados excluidos", f"{summary['cancelled']:,}")
+            check_cols[3].metric("DISLUB excluido", f"${summary['excluded_dislub']:,.2f}")
+            st.info(
+                "Este reporte permite cerrar ventas y comparar clientes. Como no trae líneas de productos, "
+                "la comparación producto por producto seguirá tomando los PDF cargados en Rentabilidad."
+            )
+        except Exception as exc:
+            st.error(f"No pude validar este archivo: {exc}")
+
     close_month_names = {1:"Enero", 2:"Febrero", 3:"Marzo", 4:"Abril", 5:"Mayo", 6:"Junio", 7:"Julio", 8:"Agosto", 9:"Septiembre", 10:"Octubre", 11:"Noviembre", 12:"Diciembre"}
     current_close_month = cutoff.strftime("%Y-%m")
     saved_closures = st.session_state.close_store.get("months", {})
-    close_month_options = sorted(set(saved_closures) | {current_close_month}, reverse=True)
+    uploaded_close_month = uploaded_close_summary["month"] if uploaded_close_summary else None
+    close_month_options = sorted(set(saved_closures) | {current_close_month} | ({uploaded_close_month} if uploaded_close_month else set()), reverse=True)
     selected_close_month = st.selectbox(
         "¿Qué mes quieres revisar?",
         close_month_options,
@@ -2618,7 +2724,7 @@ with tab9:
         key="selected_close_month",
     )
     saved_snapshot = saved_closures.get(selected_close_month)
-    is_live_month = selected_close_month == current_close_month
+    is_live_month = selected_close_month == current_close_month or selected_close_month == uploaded_close_month
 
     if is_live_month:
         setup_left, setup_right = st.columns([2, 1])
@@ -2632,7 +2738,11 @@ with tab9:
             key=f"close_budget_{selected_close_month}",
         )
         profit_cut = st.session_state.profit_store.get("months", {}).get(selected_close_month)
-        if profit_cut and not profit_cut.get("invoices", pd.DataFrame()).empty:
+        if uploaded_close_lines is not None and selected_close_month == uploaded_close_month:
+            close_invoices = uploaded_close_lines
+            close_costs = pd.DataFrame()
+            source_message = "Usamos el archivo de asientos contables validado. Los cancelados y DISLUB quedan excluidos."
+        elif profit_cut and not profit_cut.get("invoices", pd.DataFrame()).empty:
             close_invoices = profit_cut["invoices"]
             close_costs = profit_cut.get("costs", pd.DataFrame())
             source_message = "Usamos las facturas y costos guardados en Rentabilidad."
@@ -2778,9 +2888,63 @@ with tab9:
             top_product_col.plotly_chart(product_fig, width="stretch")
 
         st.subheader("6. Producto por producto: ¿qué cambió?")
-        current_products = pd.DataFrame(snapshot.get("products", []))
-        previous_products = pd.DataFrame((previous_snapshot or {}).get("products", []))
+        def complete_month_products(month_key, frozen_snapshot):
+            """Use the most complete detailed source available for the month."""
+            month_cut = st.session_state.profit_store.get("months", {}).get(month_key, {})
+            candidates = []
+            profit_invoices = month_cut.get("invoices", pd.DataFrame())
+            if profit_invoices is not None and not profit_invoices.empty:
+                candidates.append(("Rentabilidad", profit_invoices.copy()))
+            if invoice_df is not None and not invoice_df.empty:
+                candidates.append(("Facturas del corte comercial", invoice_df.copy()))
+
+            product_catalog = pd.concat(
+                [frame[["code", "product"]] for frame in (forecast_df, stock_df)
+                 if frame is not None and not frame.empty and {"code", "product"}.issubset(frame.columns)],
+                ignore_index=True,
+            ).drop_duplicates("code") if any(
+                frame is not None and not frame.empty and {"code", "product"}.issubset(frame.columns)
+                for frame in (forecast_df, stock_df)
+            ) else pd.DataFrame(columns=["code", "product"])
+            product_name_map = product_catalog.set_index("code")["product"].to_dict() if not product_catalog.empty else {}
+
+            prepared = []
+            for source_name, product_lines in candidates:
+                if "date" not in product_lines or "code" not in product_lines:
+                    continue
+                product_lines["date"] = pd.to_datetime(product_lines["date"], errors="coerce")
+                product_lines = product_lines[
+                    product_lines["date"].dt.to_period("M") == pd.Period(month_key, freq="M")
+                ].copy()
+                if not product_lines.empty:
+                    product_lines["code"] = product_lines["code"].map(profit_sku)
+                    product_lines = product_lines[product_lines["code"].notna()].copy()
+                    if "product" not in product_lines:
+                        product_lines["product"] = product_lines["code"].map(product_name_map)
+                    else:
+                        product_lines["product"] = product_lines["product"].fillna(product_lines["code"].map(product_name_map))
+                    product_lines["product"] = product_lines["product"].fillna(product_lines["code"])
+                    product_lines["net_sales"] = pd.to_numeric(product_lines["net_sales"], errors="coerce").fillna(0)
+                    product_lines["quantity"] = pd.to_numeric(product_lines.get("quantity", 0), errors="coerce").fillna(0)
+                    grouped = product_lines.groupby("code", as_index=False).agg(
+                        name=("product", "first"),
+                        value=("net_sales", "sum"),
+                        units=("quantity", "sum"),
+                    )
+                    prepared.append((grouped["code"].nunique(), len(product_lines), source_name, grouped))
+            if prepared:
+                return max(prepared, key=lambda item: (item[0], item[1]))[3]
+            return pd.DataFrame((frozen_snapshot or {}).get("products", []))
+
+        current_products = complete_month_products(selected_close_month, snapshot)
+        previous_products = complete_month_products(previous_key, previous_snapshot)
         if previous_snapshot and not current_products.empty and not previous_products.empty:
+            union_skus = len(set(previous_products["code"].astype(str)) | set(current_products["code"].astype(str)))
+            coverage_cols = st.columns(3)
+            coverage_cols[0].metric(f"SKU en {close_month_names[(period - 1).month]}", f"{previous_products['code'].nunique():,}")
+            coverage_cols[1].metric(f"SKU en {close_month_names[period.month]}", f"{current_products['code'].nunique():,}")
+            coverage_cols[2].metric("SKU distintos a comparar", f"{union_skus:,}")
+            st.caption("Estos contadores muestran cuántos códigos fueron realmente reconocidos en las facturas detalladas de cada mes.")
             current_products = current_products.rename(columns={"name":"Producto actual", "value":"Venta actual", "units":"Unidades actuales"})
             previous_products = previous_products.rename(columns={"name":"Producto anterior", "value":"Venta anterior", "units":"Unidades anteriores"})
             product_comparison = previous_products.merge(current_products, on="code", how="outer")
@@ -2827,9 +2991,12 @@ with tab9:
                 if compare_measure == "Venta en dólares"
                 else ("Unidades anteriores", "Unidades actuales")
             )
-            chart_products = visible_comparison.assign(
+            ranked_products = visible_comparison.assign(
                 Total=lambda frame: frame[[old_column, new_column]].max(axis=1)
-            ).nlargest(15, "Total")
+            ).sort_values("Total", ascending=False)
+            # The chart and the table intentionally use the same complete set.
+            # Filtering is only applied when the user searches for a product.
+            chart_products = ranked_products
             chart_data = chart_products[["Producto", old_column, new_column]].rename(
                 columns={old_column: previous_label, new_column: current_label}
             ).melt(id_vars="Producto", var_name="Mes", value_name="Valor")
@@ -2847,11 +3014,24 @@ with tab9:
                 title=f"{previous_label} frente a {current_label}",
                 xaxis_title=compare_measure,
                 yaxis_title="",
-                height=max(420, 34 * chart_products["Producto"].nunique()),
-                yaxis={"categoryorder":"total ascending"},
+                height=max(680, 46 * chart_products["Producto"].nunique()),
+                margin={"l": 360, "r": 45, "t": 75, "b": 70},
+                font={"size": 13},
+                legend={"orientation": "h", "yanchor": "bottom", "y": 1.01, "xanchor": "right", "x": 1},
+                yaxis={"categoryorder":"total ascending", "automargin": True, "tickfont": {"size": 12}},
+                xaxis={"automargin": True, "tickfont": {"size": 12}},
+                bargap=.22,
             )
-            st.plotly_chart(comparison_product_fig, width="stretch")
+            comparison_product_fig.update_traces(textposition="inside", insidetextanchor="middle")
+            st.caption("💡 Pase el cursor para ver el valor exacto o use el botón de pantalla completa en la esquina del gráfico.")
+            st.plotly_chart(
+                comparison_product_fig,
+                width="stretch",
+                config={"displaylogo": False, "scrollZoom": True, "responsive": True},
+            )
 
+            st.markdown("#### 📋 Tabla completa de productos")
+            st.caption("Aquí aparecen todos los productos. Puede ordenar cualquier columna o ampliar la tabla con el botón de pantalla completa.")
             comparison_table = visible_comparison.sort_values("Diferencia $", ascending=False).rename(columns={"code":"Código"})[[
                 "Código", "Producto", "Señal", "Unidades anteriores", "Unidades actuales",
                 "Venta anterior", "Venta actual", "Diferencia $", "Cambio %",
@@ -2863,9 +3043,11 @@ with tab9:
                 comparison_table,
                 hide_index=True,
                 width="stretch",
-                height=min(620, 100 + 35 * len(comparison_table)),
+                height=min(820, 120 + 38 * len(comparison_table)),
                 column_config={
+                    "Código": st.column_config.TextColumn(width="small"),
                     "Producto": st.column_config.TextColumn(width="large"),
+                    "Señal": st.column_config.TextColumn(width="medium"),
                     "Unidades anteriores": st.column_config.NumberColumn(format="%,.2f"),
                     "Unidades actuales": st.column_config.NumberColumn(format="%,.2f"),
                     "Venta anterior": st.column_config.NumberColumn(format="$%,.2f"),
