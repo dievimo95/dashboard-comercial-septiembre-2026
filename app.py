@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import re
 import base64
 import uuid
@@ -2994,9 +2995,28 @@ with tab9:
             ranked_products = visible_comparison.assign(
                 Total=lambda frame: frame[[old_column, new_column]].max(axis=1)
             ).sort_values("Total", ascending=False)
-            # The chart and the table intentionally use the same complete set.
-            # Filtering is only applied when the user searches for a product.
-            chart_products = ranked_products
+            # Keep every SKU available, but show a readable group at a time.
+            # The complete list remains in the table directly below.
+            products_per_page = 12
+            product_count = len(ranked_products)
+            page_count = max(1, int(math.ceil(product_count / products_per_page)))
+            page_col, page_note_col = st.columns([1, 2])
+            product_page = page_col.selectbox(
+                "Grupo de productos",
+                list(range(1, page_count + 1)),
+                format_func=lambda page: (
+                    f"Grupo {page} · productos {(page - 1) * products_per_page + 1}–"
+                    f"{min(page * products_per_page, product_count)}"
+                ),
+                key=f"close_product_page_v2_{selected_close_month}_{compare_measure}",
+            )
+            page_start = (product_page - 1) * products_per_page
+            page_end = min(page_start + products_per_page, product_count)
+            chart_products = ranked_products.iloc[page_start:page_end]
+            page_note_col.info(
+                f"Mostrando {page_start + 1}–{page_end} de {product_count} productos. "
+                "Cambie de grupo para revisar los siguientes; ninguno queda fuera de la tabla."
+            )
             chart_data = chart_products[["Producto", old_column, new_column]].rename(
                 columns={old_column: previous_label, new_column: current_label}
             ).melt(id_vars="Producto", var_name="Mes", value_name="Valor")
@@ -3014,12 +3034,12 @@ with tab9:
                 title=f"{previous_label} frente a {current_label}",
                 xaxis_title=compare_measure,
                 yaxis_title="",
-                height=max(680, 46 * chart_products["Producto"].nunique()),
+                height=max(680, 54 * chart_products["Producto"].nunique()),
                 margin={"l": 360, "r": 45, "t": 75, "b": 70},
-                font={"size": 13},
+                font={"size": 14},
                 legend={"orientation": "h", "yanchor": "bottom", "y": 1.01, "xanchor": "right", "x": 1},
-                yaxis={"categoryorder":"total ascending", "automargin": True, "tickfont": {"size": 12}},
-                xaxis={"automargin": True, "tickfont": {"size": 12}},
+                yaxis={"categoryorder":"total ascending", "automargin": True, "tickfont": {"size": 13}},
+                xaxis={"automargin": True, "tickfont": {"size": 13}},
                 bargap=.22,
             )
             comparison_product_fig.update_traces(textposition="inside", insidetextanchor="middle")
