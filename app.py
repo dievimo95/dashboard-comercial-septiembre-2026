@@ -47,6 +47,18 @@ st.markdown(
     .hero p {margin:.4rem 0 0;color:#dceaf5;}
     .action-card {padding:14px 16px;border-radius:12px;background:#fff;border:1px solid #e5e7eb;margin-bottom:9px;}
     .small {color:#667085;font-size:.88rem;}
+    .close-title {background:linear-gradient(120deg,#173f5f,#20639b);color:white;padding:22px 26px;border-radius:18px;margin-bottom:14px;}
+    .close-title h2 {margin:0;font-size:2rem;}
+    .close-title p {margin:.45rem 0 0;color:#e9f4ff;font-size:1.05rem;}
+    .close-card {padding:17px 18px;border-radius:16px;border:1px solid #dce6ef;background:white;min-height:125px;box-shadow:0 2px 8px rgba(20,50,80,.06);}
+    .close-card .emoji {font-size:1.55rem;}
+    .close-card .label {color:#52606d;font-size:.92rem;margin-top:5px;}
+    .close-card .value {color:#172b4d;font-size:1.7rem;font-weight:750;margin-top:4px;white-space:nowrap;}
+    .close-card .hint {color:#748094;font-size:.78rem;margin-top:5px;}
+    .close-green {border-top:6px solid #43aa8b;}
+    .close-red {border-top:6px solid #ef5350;}
+    .close-blue {border-top:6px solid #277da1;}
+    .close-yellow {border-top:6px solid #f4b942;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -210,60 +222,6 @@ def read_stock(file):
     expiry = detail.groupby("code", as_index=False)["expiry"].min()
     summary = summary[["code", "product", "available", "quantity"]].merge(expiry, on="code", how="left")
     return summary, detail
-
-
-def movement_code(value):
-    """Preserve alphanumeric movement codes so MP materials stay excluded."""
-    if pd.isna(value):
-        return None
-    raw = str(value).strip().upper()
-    bracketed = re.search(r"\[([^\]]+)\]", raw)
-    if bracketed:
-        raw = bracketed.group(1)
-    compact = re.sub(r"[^A-Z0-9]", "", raw)
-    if not compact:
-        return None
-    return compact.zfill(8) if compact.isdigit() and len(compact) <= 8 else compact
-
-
-def read_inventory_movements(file):
-    """Read Odoo stock.move.line exports used by the movement/coverage tab."""
-    raw = pd.read_excel(file, sheet_name=0)
-    normalized = {_plain_header(column): column for column in raw.columns}
-
-    def find(*terms):
-        return next((original for header, original in normalized.items() if all(term in header for term in terms)), None)
-
-    source_col = find("desde") or find("origen")
-    state_col = find("estado")
-    date_col = find("fecha")
-    destination_col = find("hasta") or find("destino")
-    lot_col = find("lote")
-    product_col = find("producto")
-    quantity_col = find("realizado") or find("cantidad")
-    reference_col = find("referencia")
-    uom_col = find("unidad", "medida") or find("udm")
-    required = {"Desde": source_col, "Estado": state_col, "Fecha": date_col, "Hasta": destination_col, "Producto": product_col, "Realizado": quantity_col, "Unidad de medida": uom_col}
-    missing = [label for label, column in required.items() if column is None]
-    if missing:
-        raise ValueError("Faltan columnas en movimientos: " + ", ".join(missing))
-
-    result = pd.DataFrame({
-        "from_location": raw[source_col], "state": raw[state_col], "date": raw[date_col],
-        "to_location": raw[destination_col], "lot": raw[lot_col] if lot_col else "",
-        "product_raw": raw[product_col], "quantity": raw[quantity_col],
-        "reference": raw[reference_col] if reference_col else "", "uom": raw[uom_col],
-    })
-    result["code"] = result["product_raw"].map(movement_code)
-    result["product"] = result["product_raw"].astype(str).str.replace(r"^\s*\[[^\]]+\]\s*", "", regex=True).str.strip()
-    result["date"] = pd.to_datetime(result["date"], errors="coerce")
-    result["quantity"] = pd.to_numeric(result["quantity"], errors="coerce").fillna(0)
-    result["state"] = result["state"].fillna("").astype(str).str.strip()
-    result["from_location"] = result["from_location"].fillna("").astype(str).str.strip()
-    result["to_location"] = result["to_location"].fillna("").astype(str).str.strip()
-    result["uom"] = result["uom"].fillna("").astype(str).str.strip()
-    result = result[result["code"].notna() & result["date"].notna() & result["quantity"].ge(0) & result["state"].str.lower().eq("done")].copy()
-    return result[["code", "product", "date", "from_location", "to_location", "lot", "quantity", "reference", "uom", "state"]].reset_index(drop=True)
 
 
 def read_pdf(file):
@@ -495,6 +453,115 @@ def unpack_profit_store(encoded):
     return store
 
 
+def blank_close_store():
+    return {"months": {}}
+
+
+def pack_close_store(store):
+    raw = json.dumps({"version": 1, "months": store.get("months", {})}, ensure_ascii=False).encode("utf-8")
+    return base64.b64encode(zlib.compress(raw, level=9)).decode("ascii")
+
+
+def unpack_close_store(encoded):
+    if not isinstance(encoded, str) or len(encoded) > 5_000_000:
+        raise ValueError("Histórico de cierres inválido")
+    raw = zlib.decompress(base64.b64decode(encoded, validate=True))
+    if len(raw) > 10_000_000:
+        raise ValueError("Histórico de cierres demasiado grande")
+    payload = json.loads(raw)
+    if payload.get("version") != 1:
+        raise ValueError("Versión del cierre no compatible")
+    return {"months": payload.get("months", {})}
+
+
+def build_close_snapshot(month_key, budget, invoice_lines, cost_lines=None):
+    """Create a small, frozen month summary from profitability data."""
+    invoices = invoice_lines.copy()
+    if invoices.empty:
+        return None
+    invoices["date"] = pd.to_datetime(invoices["date"], errors="coerce")
+    invoices = invoices[invoices["date"].dt.to_period("M") == pd.Period(month_key, freq="M")].copy()
+    if invoices.empty:
+        return None
+
+    if "document_type" not in invoices:
+        invoices["document_type"] = "Factura"
+    if "product" not in invoices:
+        invoices["product"] = invoices["code"].astype(str)
+    if "customer" not in invoices:
+        invoices["customer"] = "Cliente sin identificar"
+    if "invoice_type" not in invoices:
+        invoices["invoice_type"] = invoices["invoice"].astype(str).map(
+            lambda value: "Exportación" if value.startswith("001-901-") else "Nacional" if value.startswith("001-100-") else "Otra"
+        )
+    invoices["net_sales"] = pd.to_numeric(invoices["net_sales"], errors="coerce").fillna(0)
+    invoices["quantity"] = pd.to_numeric(invoices.get("quantity", 0), errors="coerce").fillna(0)
+    is_credit = invoices["document_type"].astype(str).str.contains("crédito|credit", case=False, regex=True, na=False) | invoices["net_sales"].lt(0)
+    billed = float(invoices.loc[~is_credit, "net_sales"].clip(lower=0).sum())
+    credits = float(invoices.loc[is_credit, "net_sales"].abs().sum())
+    net_sales = billed - credits
+
+    channel = invoices.groupby("invoice_type")["net_sales"].sum().to_dict()
+    national = float(channel.get("Nacional", 0))
+    exports = float(channel.get("Exportación", 0))
+    other = float(channel.get("Otra", 0))
+
+    cost_total = profit_total = 0.0
+    margin = None
+    critical_skus = loss_skus = 0
+    cost_coverage = 0.0
+    valid_profit = pd.DataFrame()
+    if cost_lines is not None and not cost_lines.empty:
+        calculated = profitability_lines(invoices, cost_lines)
+        valid_profit = calculated[calculated["unit_cost"].notna() & calculated["unit_cost"].gt(0)].copy()
+        total_codes = calculated["code"].nunique()
+        valid_codes = valid_profit["code"].nunique()
+        cost_coverage = valid_codes / total_codes if total_codes else 0.0
+        cost_total = float(valid_profit["cost_of_sales"].sum())
+        profit_total = float(valid_profit["gross_profit"].sum())
+        valid_net = float(valid_profit["net_sales"].sum())
+        margin = profit_total / valid_net if valid_net else None
+        sku_profit = valid_profit.groupby(["code", "invoice_type"], as_index=False).agg(
+            product=("product", "first"), Venta=("net_sales", "sum"),
+            Costo=("cost_of_sales", "sum"), Utilidad=("gross_profit", "sum"),
+        )
+        sku_profit["Margen"] = sku_profit["Utilidad"] / sku_profit["Venta"].replace(0, pd.NA)
+        critical_skus = int(((sku_profit["Margen"] >= 0) & (sku_profit["Margen"] <= .15)).sum())
+        loss_skus = int((sku_profit["Margen"] < 0).sum())
+
+    top_source = valid_profit if not valid_profit.empty else invoices
+    customer_top = (
+        top_source.groupby("customer", as_index=False)["net_sales"].sum()
+        .nlargest(6, "net_sales").rename(columns={"customer": "name", "net_sales": "value"})
+    )
+    product_top = (
+        top_source.groupby("code", as_index=False).agg(name=("product", "first"), value=("net_sales", "sum"))
+        .nlargest(6, "value")
+    )
+    return {
+        "month": month_key,
+        "saved_at": pd.Timestamp.now().isoformat(),
+        "budget": float(budget or 0),
+        "billed": billed,
+        "credits": credits,
+        "net_sales": net_sales,
+        "national": national,
+        "exports": exports,
+        "other": other,
+        "cost": cost_total,
+        "profit": profit_total,
+        "margin": margin,
+        "critical_skus": critical_skus,
+        "loss_skus": loss_skus,
+        "cost_coverage": cost_coverage,
+        "invoice_count": int(invoices["invoice"].nunique()),
+        "top_customers": customer_top.to_dict("records"),
+        "top_products": product_top.to_dict("records"),
+        "has_profitability": not valid_profit.empty,
+        "has_credit_classification": "document_type" in invoice_lines.columns,
+    }
+
+
 def profitability_lines(invoices, costs):
     clean_costs = costs.drop_duplicates("code", keep=False).copy()
     result = invoices.merge(clean_costs[["code", "cost_product", "unit_cost", "uom"]], on="code", how="left")
@@ -546,7 +613,6 @@ def blank_bundle():
         "fill_rate_invoices": pd.DataFrame(columns=["invoice", "date", "week", "customer", "code", "quantity", "unit_price", "net_sales", "pdf_page", "purchase_order"]),
         "orders": pd.DataFrame(columns=["Cliente", "Orden", "Fecha pedido", "Fecha inicio", "Fecha límite", "Producto en pedido", "Referencia cliente", "Cajas", "Unidades por caja", "Unidades pedidas", "Código SKU", "Archivo", "Revisión"]),
         "weekly_order": pd.DataFrame(columns=["code", "ordered"]),
-        "movements": pd.DataFrame(columns=["code", "product", "date", "from_location", "to_location", "lot", "quantity", "reference", "uom", "state"]),
         "cutoff": pd.NaT,
     }
 
@@ -554,7 +620,7 @@ def blank_bundle():
 def pack_bundle(bundle):
     data = {
         "version": 4,
-        "tables": {name: bundle.get(name, blank_bundle()[name]).to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices", "fill_rate_invoices", "orders", "weekly_order", "movements"]},
+        "tables": {name: bundle.get(name, blank_bundle()[name]).to_json(orient="records", date_format="iso") for name in ["forecast", "stock", "lots", "invoices", "fill_rate_invoices", "orders", "weekly_order"]},
         "cutoff": None if pd.isna(bundle["cutoff"]) else pd.Timestamp(bundle["cutoff"]).isoformat(),
     }
     return base64.b64encode(zlib.compress(json.dumps(data).encode("utf-8"), level=9)).decode("ascii")
@@ -571,10 +637,10 @@ def unpack_bundle(encoded):
     if data.get("version") not in [1, 2, 3, 4]:
         raise ValueError("Versión de copia no compatible")
     bundle = blank_bundle()
-    for name in ["forecast", "stock", "lots", "invoices", "fill_rate_invoices", "orders", "weekly_order", "movements"]:
+    for name in ["forecast", "stock", "lots", "invoices", "fill_rate_invoices", "orders", "weekly_order"]:
         if name in data["tables"]:
             bundle[name] = pd.read_json(io.StringIO(data["tables"][name]), orient="records", dtype={"code": str}, convert_dates=False)
-    for name, column in [("stock", "expiry"), ("lots", "expiry"), ("invoices", "date"), ("fill_rate_invoices", "date"), ("orders", "Fecha pedido"), ("orders", "Fecha inicio"), ("orders", "Fecha límite"), ("movements", "date")]:
+    for name, column in [("stock", "expiry"), ("lots", "expiry"), ("invoices", "date"), ("fill_rate_invoices", "date"), ("orders", "Fecha pedido"), ("orders", "Fecha inicio"), ("orders", "Fecha límite")]:
         if column in bundle[name]:
             bundle[name][column] = pd.to_datetime(bundle[name][column], errors="coerce")
     bundle["cutoff"] = pd.to_datetime(data["cutoff"]) if data.get("cutoff") else pd.NaT
@@ -1016,6 +1082,34 @@ if isinstance(profit_storage_result, dict):
     elif profit_storage_result.get("action") == "error":
         st.session_state.profit_notice = f"No se pudo guardar Rentabilidad: {profit_storage_result.get('message', 'error desconocido')}"
 
+# Month-end snapshots are intentionally stored separately. Once saved, a
+# historical month does not change when a new operational cut is uploaded.
+if "close_store" not in st.session_state:
+    st.session_state.close_store = blank_close_store()
+if "close_storage_command" not in st.session_state:
+    st.session_state.close_storage_command = {"action": "load", "revision": "initial-close", "payload": ""}
+close_command = st.session_state.close_storage_command
+close_storage_result = browser_store(
+    **close_command,
+    storage_key="control-comercial-cierres-v1",
+    key="saved_month_closures",
+)
+if isinstance(close_storage_result, dict):
+    if close_storage_result.get("action") == "loaded" and not st.session_state.get("close_storage_loaded"):
+        st.session_state.close_storage_loaded = True
+        if close_storage_result.get("payload"):
+            try:
+                st.session_state.close_store = unpack_close_store(close_storage_result["payload"])
+                st.session_state.close_notice = "Se recuperaron los cierres mensuales guardados."
+            except Exception as exc:
+                st.session_state.close_notice = f"No pude recuperar los cierres: {exc}"
+        st.rerun()
+    elif close_storage_result.get("action") == "saved" and close_storage_result.get("revision") == close_command["revision"]:
+        st.session_state.close_storage_command = {"action": "load", "revision": close_command["revision"], "payload": ""}
+        st.session_state.close_notice = "Cierre mensual guardado en este navegador."
+    elif close_storage_result.get("action") == "error":
+        st.session_state.close_notice = f"No se pudo guardar el cierre: {close_storage_result.get('message', 'error desconocido')}"
+
 with st.sidebar:
     st.header("Actualizar información")
     st.caption("El corte validado se guarda en este navegador y vuelve al refrescar. No se comparte con otros usuarios. Conserve también sus archivos originales.")
@@ -1049,13 +1143,15 @@ with st.sidebar:
     generation = st.session_state.upload_generation
     forecast_file = st.file_uploader("Forecast (.xlsx)", type="xlsx", key=f"forecast_{generation}")
     stock_file = st.file_uploader("Stock (.xlsx)", type="xlsx", key=f"stock_{generation}")
-    movement_file = st.file_uploader("Movimientos de inventario (.xlsx)", type="xlsx", key=f"movements_{generation}")
-    st.caption("Opcional. Alimenta Movimiento y cobertura y queda guardado con el corte.")
     pdf_files = st.file_uploader(
         "Facturas nuevas (.pdf)", type="pdf", accept_multiple_files=True, key=f"pdf_{generation}"
     )
     st.caption("Puede seleccionar varios PDF a la vez. Las facturas cuyo número ya esté guardado se ignorarán.")
-    signature = (file_signature(forecast_file), file_signature(stock_file), file_signature(movement_file), tuple(file_signature(file) for file in pdf_files or []))
+    signature = (
+        file_signature(forecast_file),
+        file_signature(stock_file),
+        tuple(file_signature(file) for file in pdf_files or []),
+    )
     if st.session_state.get("validated_signature") != signature:
         st.session_state.pop("validated_bundle", None)
         st.session_state.pop("validation_summary", None)
@@ -1068,9 +1164,6 @@ with st.sidebar:
                 candidate_stock, candidate_lots = read_stock(stock_file)
             else:
                 candidate_stock, candidate_lots = active["stock"].copy(), active["lots"].copy()
-            candidate_movements = read_inventory_movements(movement_file) if movement_file else active.get("movements", blank_bundle()["movements"]).copy()
-            if movement_file and candidate_movements.empty:
-                raise ValueError("El archivo de movimientos no contiene líneas completadas válidas.")
 
             parsed_invoices = read_invoice_pdfs(pdf_files)
             if parsed_invoices.empty:
@@ -1094,16 +1187,12 @@ with st.sidebar:
                 "date_min": new_invoices["date"].min() if not new_invoices.empty else None,
                 "date_max": new_invoices["date"].max() if not new_invoices.empty else None,
                 "cutoff": cutoff_candidate,
-                "movement_lines": len(candidate_movements),
-                "movement_date_min": candidate_movements["date"].min() if not candidate_movements.empty else None,
-                "movement_date_max": candidate_movements["date"].max() if not candidate_movements.empty else None,
-                "movements_uploaded": movement_file is not None,
             }
             if not errors:
-                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "fill_rate_invoices": active.get("fill_rate_invoices", blank_bundle()["fill_rate_invoices"]).copy(), "orders": active.get("orders", blank_bundle()["orders"]).copy(), "weekly_order": active.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy(), "movements": candidate_movements, "cutoff": cutoff_candidate}
+                st.session_state.validated_bundle = {"forecast": candidate_forecast, "stock": candidate_stock, "lots": candidate_lots, "invoices": combined_invoices, "fill_rate_invoices": active.get("fill_rate_invoices", blank_bundle()["fill_rate_invoices"]).copy(), "orders": active.get("orders", blank_bundle()["orders"]).copy(), "weekly_order": active.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy(), "cutoff": cutoff_candidate}
         except Exception as exc:
             st.session_state.validated_signature = signature
-            st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "read_lines": 0, "read_invoices": 0, "new_lines": 0, "new_invoices": 0, "duplicate_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None, "cutoff": None, "movement_lines": 0, "movement_date_min": None, "movement_date_max": None, "movements_uploaded": False}
+            st.session_state.validation_summary = {"errors": [f"No pude leer los archivos: {exc}"], "warnings": [], "read_lines": 0, "read_invoices": 0, "new_lines": 0, "new_invoices": 0, "duplicate_invoices": 0, "duplicates": 0, "date_min": None, "date_max": None, "cutoff": None}
             st.session_state.pop("validated_bundle", None)
 
     summary = st.session_state.get("validation_summary")
@@ -1121,8 +1210,6 @@ with st.sidebar:
                 st.write("No se cargaron facturas nuevas.")
             if summary.get("duplicate_invoices"):
                 st.info(f"Se ignoraron **{summary['duplicate_invoices']} facturas ya guardadas** porque su número de factura ya existe.")
-            if summary.get("movements_uploaded"):
-                st.write(f"Se guardarán **{summary['movement_lines']:,} movimientos** de inventario, desde **{pd.Timestamp(summary['movement_date_min']).strftime('%d-%b-%Y')}** hasta **{pd.Timestamp(summary['movement_date_max']).strftime('%d-%b-%Y')}**.")
             if summary.get("cutoff") is not None and not pd.isna(summary["cutoff"]):
                 st.write(f"**Fecha de corte que usará el dashboard: {pd.Timestamp(summary['cutoff']).strftime('%d/%m/%Y')}**")
             if summary["duplicates"]:
@@ -1147,7 +1234,6 @@ lots_df = active["lots"]
 invoice_df = active["invoices"]
 fill_rate_invoice_df = active.get("fill_rate_invoices", blank_bundle()["fill_rate_invoices"])
 orders_df = active.get("orders", blank_bundle()["orders"])
-movement_df = active.get("movements", blank_bundle()["movements"])
 
 if forecast_df.empty or stock_df.empty or invoice_df.empty:
     st.markdown('<div class="hero"><h1>Control comercial</h1><p>Comience un nuevo mes cargando la información.</p></div>', unsafe_allow_html=True)
@@ -1254,7 +1340,7 @@ if sold_forecast / forecast_total > elapsed:
 else:
     st.warning(f"En general vamos atrasados: se vendió {sold_forecast / forecast_total:.1%} del forecast y ha pasado {elapsed:.1%} del mes.")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente", "Pedido semanal", "Fill Rate", "Rentabilidad", "Movimiento y cobertura"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente", "Pedido semanal", "Fill Rate", "Rentabilidad", "Cierre de mes"])
 
 with tab1:
     left, right = st.columns([1, 1])
@@ -2273,13 +2359,81 @@ with tab8:
                 return summary
 
             sku_base = summarize_skus(filtered)
-            k1, k2, k3, k4, k5, k6 = st.columns(6)
+            critical_skus = sku_base[
+                (sku_base["Margen"] >= 0)
+                & (sku_base["Margen"] <= margin_low / 100)
+            ].copy()
+            loss_skus = sku_base[sku_base["Margen"] < 0].copy()
+
+            # Four wider cards keep the complete monetary values visible.
+            k1, k2, k3, k4 = st.columns(4)
             k1.metric("Venta neta", f"${net_total:,.2f}")
             k2.metric("Costo de venta", f"${cost_total:,.2f}")
             k3.metric("Utilidad bruta", f"${profit_total:,.2f}")
             k4.metric("Margen bruto", f"{margin_total:.1%}" if pd.notna(margin_total) else "—")
-            k5.metric("SKU margen crítico", f"{int(((sku_base['Margen'] >= 0) & (sku_base['Margen'] <= margin_low / 100)).sum()):,}")
-            k6.metric("SKU con pérdida", f"{int((sku_base['Margen'] < 0).sum()):,}")
+
+            risk_left, risk_right = st.columns(2)
+            if risk_left.button(
+                f"🟠 Revisar {len(critical_skus):,} SKU con margen crítico",
+                use_container_width=True,
+                disabled=critical_skus.empty,
+                key="show_critical_profit_skus",
+            ):
+                st.session_state.profit_risk_view = "critical"
+            if risk_right.button(
+                f"🔴 Revisar {len(loss_skus):,} SKU con pérdida",
+                use_container_width=True,
+                disabled=loss_skus.empty,
+                key="show_loss_profit_skus",
+            ):
+                st.session_state.profit_risk_view = "loss"
+
+            risk_mode = st.session_state.get("profit_risk_view")
+            risk_source = critical_skus if risk_mode == "critical" else loss_skus
+            if risk_mode in {"critical", "loss"} and not risk_source.empty:
+                with st.container(border=True):
+                    detail_title = (
+                        f"Detalle de {len(risk_source):,} SKU con margen crítico"
+                        if risk_mode == "critical"
+                        else f"Detalle de {len(risk_source):,} SKU con pérdida"
+                    )
+                    title_col, close_col = st.columns([6, 1])
+                    title_col.subheader(detail_title)
+                    if close_col.button("Cerrar", key="close_profit_risk_view", use_container_width=True):
+                        st.session_state.pop("profit_risk_view", None)
+                        st.rerun()
+
+                    risk_show = risk_source.sort_values("Margen").rename(columns={
+                        "code": "Código",
+                        "product": "Producto",
+                        "invoice_type": "Tipo de venta",
+                        "Unidades": "Unidades vendidas",
+                        "Venta": "Venta neta $",
+                        "Costo_vendido": "Costo vendido $",
+                        "Utilidad": "Utilidad bruta $",
+                        "Margen": "Margen bruto %",
+                    })
+                    risk_show = risk_show[[
+                        "Código", "Producto", "Tipo de venta", "Semáforo",
+                        "Unidades vendidas", "Venta neta $", "Costo vendido $",
+                        "Utilidad bruta $", "Margen bruto %",
+                    ]]
+                    risk_show["Margen bruto %"] = risk_show["Margen bruto %"].map(
+                        lambda value: f"{value:.1%}" if pd.notna(value) else "—"
+                    )
+                    st.dataframe(
+                        risk_show,
+                        hide_index=True,
+                        width="stretch",
+                        height=min(430, 80 + 36 * len(risk_show)),
+                        column_config={
+                            "Producto": st.column_config.TextColumn(width="large"),
+                            "Unidades vendidas": st.column_config.NumberColumn(format="%,.2f"),
+                            "Venta neta $": st.column_config.NumberColumn(format="$%,.2f"),
+                            "Costo vendido $": st.column_config.NumberColumn(format="$%,.2f"),
+                            "Utilidad bruta $": st.column_config.NumberColumn(format="$%,.2f"),
+                        },
+                    )
 
             view1, view2, view3, view4 = st.tabs(["Por SKU", "Por cliente", "Cliente × SKU", "Top y Bottom"])
             with view1:
@@ -2340,145 +2494,209 @@ with tab8:
                 cbottom.dataframe(bottom_clients, hide_index=True, width="stretch")
 
 with tab9:
-    st.subheader("Movimiento y cobertura de inventario")
-    st.caption("Mide las salidas netas a clientes y estima cuántos días puede cubrir el stock actual. No mezcla transferencias internas, materias primas MP ni unidades de medida diferentes.")
-    if movement_df.empty:
-        st.info("Cargue el Excel **Movimientos de inventario** en el panel izquierdo, pulse **Prevalidar información** y luego **Cargar y actualizar dashboard**.")
+    st.markdown(
+        '<div class="close-title"><h2>🧾 Cierre de mes</h2><p>La historia sencilla del mes: cuánto vendimos, cuánto ganamos y qué debemos mejorar.</p></div>',
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get("close_notice"):
+        st.info(st.session_state.pop("close_notice"))
+
+    close_month_names = {1:"Enero", 2:"Febrero", 3:"Marzo", 4:"Abril", 5:"Mayo", 6:"Junio", 7:"Julio", 8:"Agosto", 9:"Septiembre", 10:"Octubre", 11:"Noviembre", 12:"Diciembre"}
+    current_close_month = cutoff.strftime("%Y-%m")
+    saved_closures = st.session_state.close_store.get("months", {})
+    close_month_options = sorted(set(saved_closures) | {current_close_month}, reverse=True)
+    selected_close_month = st.selectbox(
+        "¿Qué mes quieres revisar?",
+        close_month_options,
+        format_func=lambda key: f"{close_month_names[int(key[5:7])]} {key[:4]}",
+        key="selected_close_month",
+    )
+    saved_snapshot = saved_closures.get(selected_close_month)
+    is_live_month = selected_close_month == current_close_month
+
+    if is_live_month:
+        setup_left, setup_right = st.columns([2, 1])
+        budget_default = float((saved_snapshot or {}).get("budget", 0))
+        monthly_budget = setup_left.number_input(
+            "🎯 Presupuesto de venta del mes ($)",
+            min_value=0.0,
+            value=budget_default,
+            step=1000.0,
+            help="Es la meta de dinero que esperábamos vender.",
+            key=f"close_budget_{selected_close_month}",
+        )
+        profit_cut = st.session_state.profit_store.get("months", {}).get(selected_close_month)
+        if profit_cut and not profit_cut.get("invoices", pd.DataFrame()).empty:
+            close_invoices = profit_cut["invoices"]
+            close_costs = profit_cut.get("costs", pd.DataFrame())
+            source_message = "Usamos las facturas y costos guardados en Rentabilidad."
+        else:
+            close_invoices = invoice_df
+            close_costs = pd.DataFrame()
+            source_message = "Usamos las facturas del corte comercial. Carga Rentabilidad para incluir costos y notas de crédito con mayor precisión."
+        live_snapshot = build_close_snapshot(selected_close_month, monthly_budget, close_invoices, close_costs)
+        setup_right.markdown("**Fuente del cierre**")
+        setup_right.caption(source_message)
+        use_live_snapshot = setup_right.toggle(
+            "Ver borrador actualizado",
+            value=not bool(saved_snapshot),
+            help="Apágalo para ver exactamente el cierre que quedó guardado.",
+            key=f"live_close_{selected_close_month}",
+        )
+        if live_snapshot and use_live_snapshot and setup_right.button(
+            "🔒 Guardar este cierre",
+            type="primary",
+            use_container_width=True,
+            key="save_month_close",
+        ):
+            st.session_state.close_store.setdefault("months", {})[selected_close_month] = live_snapshot
+            st.session_state.close_storage_loaded = True
+            st.session_state.close_storage_command = {
+                "action": "save",
+                "revision": uuid.uuid4().hex,
+                "payload": pack_close_store(st.session_state.close_store),
+            }
+            st.session_state.close_notice = f"Cierre de {close_month_names[int(selected_close_month[5:7])]} guardado. Ya no cambiará solo."
+            st.rerun()
+        snapshot = live_snapshot if use_live_snapshot or not saved_snapshot else saved_snapshot
+        if saved_snapshot:
+            st.caption("🔒 Este mes ya tiene un cierre guardado. Activa “Ver borrador actualizado” únicamente si deseas revisarlo y reemplazarlo.")
     else:
-        movements = movement_df.copy()
-        movements["date"] = pd.to_datetime(movements["date"], errors="coerce")
-        movements["quantity"] = pd.to_numeric(movements["quantity"], errors="coerce").fillna(0)
-        movements = movements[movements["date"].notna() & ~movements["code"].fillna("").astype(str).str.upper().str.startswith("MP")].copy()
-        movements["is_customer_out"] = movements["to_location"].str.contains("partners/customers", case=False, na=False)
-        movements["is_customer_return"] = movements["from_location"].str.contains("partners/customers", case=False, na=False)
+        snapshot = saved_snapshot
+        st.success("🔒 Este es un cierre histórico guardado. No cambia cuando cargas información de otro mes.")
 
-        movement_min = movements["date"].min().date()
-        movement_max = movements["date"].max().date()
-        default_start = max(movement_min, (pd.Timestamp(movement_max) - pd.Timedelta(days=29)).date())
-        f1, f2, f3 = st.columns([1, 1.5, 1.5])
-        uom_options = sorted(value for value in movements["uom"].dropna().unique() if str(value).strip())
-        default_uom_index = uom_options.index("Unidades") if "Unidades" in uom_options else 0
-        selected_uom = f1.selectbox("Unidad de medida", uom_options, index=default_uom_index, key="movement_uom")
-        movement_dates = f2.date_input("Periodo de salidas", value=(default_start, movement_max), min_value=movement_min, max_value=movement_max, key="movement_dates")
-        movement_search = f3.text_input("Buscar SKU o producto", key="movement_search")
-        if isinstance(movement_dates, (tuple, list)) and len(movement_dates) == 2:
-            period_start, period_end = movement_dates
+    if not snapshot:
+        st.warning("Todavía no hay facturas para construir el cierre de este mes.")
+    else:
+        period = pd.Period(selected_close_month, freq="M")
+        previous_key = (period - 1).strftime("%Y-%m")
+        prior_year_key = (period - 12).strftime("%Y-%m")
+        previous_snapshot = saved_closures.get(previous_key)
+        prior_year_snapshot = saved_closures.get(prior_year_key)
+
+        def money(value):
+            return f"${float(value or 0):,.2f}"
+
+        def growth(current, previous):
+            previous_value = float((previous or {}).get("net_sales", 0))
+            return (float(current or 0) / previous_value - 1) if previous_value else None
+
+        def close_card(column, emoji, label, value, hint, color):
+            column.markdown(
+                f'<div class="close-card {color}"><div class="emoji">{emoji}</div><div class="label">{label}</div><div class="value">{value}</div><div class="hint">{hint}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        month_growth = growth(snapshot["net_sales"], previous_snapshot)
+        year_growth = growth(snapshot["net_sales"], prior_year_snapshot)
+        compliance = snapshot["net_sales"] / snapshot["budget"] if snapshot.get("budget") else None
+
+        st.subheader("1. Primero: ¿cuánto dinero vendimos?")
+        st.caption("Piensa en una alcancía: entra dinero por facturas, sale dinero por devoluciones y lo que queda es la venta real.")
+        money_cols = st.columns(3)
+        close_card(money_cols[0], "🧾", "Facturas emitidas", money(snapshot["billed"]), "Todo lo que se facturó.", "close-blue")
+        close_card(money_cols[1], "↩️", "Notas de crédito", money(snapshot["credits"]), "Dinero que se devolvió o corrigió.", "close-red")
+        close_card(money_cols[2], "💰", "Venta comercial neta", money(snapshot["net_sales"]), "Facturas menos notas de crédito.", "close-green")
+
+        st.subheader("2. ¿Cumplimos la meta?")
+        goal_cols = st.columns(4)
+        close_card(goal_cols[0], "🎯", "Meta del mes", money(snapshot["budget"]), "Lo que queríamos vender.", "close-blue")
+        close_card(
+            goal_cols[1], "🏁", "Meta cumplida",
+            f"{compliance:.1%}" if compliance is not None else "Falta meta",
+            "100% significa que llegamos.",
+            "close-green" if compliance is not None and compliance >= 1 else "close-yellow",
+        )
+        close_card(
+            goal_cols[2], "📅", "Contra el mes anterior",
+            f"{month_growth:+.1%}" if month_growth is not None else "Sin historia",
+            "Compara con el cierre anterior.",
+            "close-green" if month_growth is not None and month_growth >= 0 else "close-red" if month_growth is not None else "close-blue",
+        )
+        close_card(
+            goal_cols[3], "🗓️", "Contra el año anterior",
+            f"{year_growth:+.1%}" if year_growth is not None else "Sin historia",
+            "Compara el mismo mes de otro año.",
+            "close-green" if year_growth is not None and year_growth >= 0 else "close-red" if year_growth is not None else "close-blue",
+        )
+
+        st.subheader("3. ¿La venta dejó ganancia?")
+        profit_cols = st.columns(5)
+        if snapshot.get("has_profitability"):
+            close_card(profit_cols[0], "🏭", "Costo de lo vendido", money(snapshot["cost"]), "Lo que costaron los productos.", "close-yellow")
+            close_card(profit_cols[1], "🪙", "Ganancia bruta", money(snapshot["profit"]), "Venta menos costo.", "close-green" if snapshot["profit"] >= 0 else "close-red")
+            close_card(profit_cols[2], "📊", "Margen bruto", f"{snapshot['margin']:.1%}" if snapshot.get("margin") is not None else "—", "Ganancia por cada dólar vendido.", "close-blue")
+            close_card(profit_cols[3], "🟠", "SKU críticos", f"{snapshot['critical_skus']:,}", "Ganan 15% o menos.", "close-yellow")
+            close_card(profit_cols[4], "🔴", "SKU con pérdida", f"{snapshot['loss_skus']:,}", "Se vendieron perdiendo dinero.", "close-red")
         else:
-            period_start, period_end = default_start, movement_max
-        period_days = max((period_end - period_start).days + 1, 1)
+            st.info("Para ver costo, ganancia y margen, primero guarda las facturas y costos en la pestaña Rentabilidad.")
 
-        selected_movements = movements[movements["uom"].eq(selected_uom) & movements["date"].dt.date.between(period_start, period_end)].copy()
-        outbound = selected_movements[selected_movements["is_customer_out"]].copy()
-        returns = selected_movements[selected_movements["is_customer_return"]].copy()
-        outbound_summary = outbound.groupby("code", as_index=False).agg(Salidas=("quantity", "sum"), Movimientos=("quantity", "size"))
-        return_summary = returns.groupby("code", as_index=False).agg(Devoluciones=("quantity", "sum"))
-        latest_dispatch = movements[movements["uom"].eq(selected_uom) & movements["is_customer_out"] & movements["date"].dt.date.le(period_end)].groupby("code", as_index=False)["date"].max().rename(columns={"date": "Última salida"})
-
-        catalog = pd.concat([forecast_df[["code", "product"]], stock_df[["code", "product"]], movements[["code", "product"]]], ignore_index=True).dropna(subset=["code"])
-        catalog = catalog.drop_duplicates("code", keep="first")
-        movement_codes = set(selected_movements["code"].dropna().astype(str))
-        if selected_uom == "Unidades":
-            movement_codes |= set(stock_df["code"].dropna().astype(str))
-        coverage = catalog[catalog["code"].astype(str).isin(movement_codes)].copy()
-        coverage = coverage.merge(outbound_summary, on="code", how="left").merge(return_summary, on="code", how="left").merge(latest_dispatch, on="code", how="left")
-        coverage[["Salidas", "Devoluciones", "Movimientos"]] = coverage[["Salidas", "Devoluciones", "Movimientos"]].fillna(0)
-        coverage["Salida neta"] = (coverage["Salidas"] - coverage["Devoluciones"]).clip(lower=0)
-        coverage["Promedio diario"] = coverage["Salida neta"] / period_days
-        if selected_uom == "Unidades":
-            stock_current = stock_df[["code", "available"]].copy().rename(columns={"available": "Stock actual"})
-            stock_current["Stock actual"] = pd.to_numeric(stock_current["Stock actual"], errors="coerce")
-            coverage = coverage.merge(stock_current, on="code", how="left")
-            coverage["Cobertura días"] = coverage["Stock actual"] / coverage["Promedio diario"].replace(0, pd.NA)
-        else:
-            coverage["Stock actual"] = pd.NA
-            coverage["Cobertura días"] = pd.NA
-        coverage["Días sin salida"] = (pd.Timestamp(period_end) - pd.to_datetime(coverage["Última salida"], errors="coerce").dt.normalize()).dt.days
-
-        def movement_status(row):
-            if row["Promedio diario"] <= 0:
-                return "⚪ Sin movimiento"
-            if pd.isna(row["Stock actual"]):
-                return "🔵 Stock no comparable"
-            if row["Stock actual"] <= 0:
-                return "🔴 Sin stock"
-            if row["Cobertura días"] <= 7:
-                return "🔴 Cobertura crítica"
-            if row["Cobertura días"] <= 15:
-                return "🟠 Cobertura baja"
-            if row["Cobertura días"] <= 30:
-                return "🟢 Cobertura adecuada"
-            if row["Cobertura días"] <= 60:
-                return "🔵 Cobertura alta"
-            return "🟣 Sobreinventario"
-
-        def movement_action(row):
-            actions = {
-                "⚪ Sin movimiento": "Revisar demanda antes de producir; activar venta si existe stock.",
-                "🔵 Stock no comparable": "Cargar stock en la misma unidad para calcular cobertura.",
-                "🔴 Sin stock": "Programar producción o reposición urgente.",
-                "🔴 Cobertura crítica": "Priorizar producción o reposición.",
-                "🟠 Cobertura baja": "Incluir en el próximo plan de producción.",
-                "🟣 Sobreinventario": "Frenar producción y activar acción comercial.",
-                "🔵 Cobertura alta": "Vigilar rotación y evitar producir de más.",
-            }
-            return actions.get(row["Estado"], "Mantener seguimiento.")
-
-        coverage["Estado"] = coverage.apply(movement_status, axis=1)
-        coverage["Acción"] = coverage.apply(movement_action, axis=1)
-        coverage["Unidad"] = selected_uom
-        coverage = coverage.rename(columns={"code": "Código", "product": "Producto"})
-        if movement_search:
-            coverage = coverage[coverage["Código"].astype(str).str.contains(movement_search, case=False, na=False) | coverage["Producto"].astype(str).str.contains(movement_search, case=False, na=False)]
-        status_options = coverage["Estado"].dropna().unique().tolist()
-        selected_statuses = st.multiselect("Mostrar estados", status_options, default=status_options, key="movement_statuses")
-        if selected_statuses:
-            coverage = coverage[coverage["Estado"].isin(selected_statuses)]
-
-        total_net = coverage["Salida neta"].sum()
-        active_skus = int(coverage["Salida neta"].gt(0).sum())
-        critical_skus = int(coverage["Estado"].isin(["🔴 Sin stock", "🔴 Cobertura crítica"]).sum())
-        no_movement = int((coverage["Estado"].eq("⚪ Sin movimiento") & pd.to_numeric(coverage["Stock actual"], errors="coerce").fillna(0).gt(0)).sum())
-        valid_coverage = pd.to_numeric(coverage["Cobertura días"], errors="coerce").dropna()
-        median_coverage = valid_coverage.median() if not valid_coverage.empty else pd.NA
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Salida neta", f"{total_net:,.0f} {selected_uom.lower()}")
-        m2.metric("SKU con salida", f"{active_skus:,}")
-        m3.metric("Cobertura crítica", f"{critical_skus:,}")
-        m4.metric("Con stock sin salida", f"{no_movement:,}")
-        m5.metric("Cobertura mediana", f"{median_coverage:,.1f} días" if pd.notna(median_coverage) else "—")
-
-        if selected_uom != "Unidades":
-            st.warning("Para esta unidad se muestran movimientos, pero no cobertura: el stock actual está consolidado en unidades y no se harán conversiones automáticas.")
-        st.caption(f"Periodo analizado: {period_start.strftime('%d/%m/%Y')}–{period_end.strftime('%d/%m/%Y')} ({period_days} días). Salida neta = despachos a clientes − devoluciones desde clientes. La cobertura orienta la decisión, pero no reemplaza la revisión del plan de producción.")
-
-        chart_source = coverage[coverage["Salida neta"].gt(0)].nlargest(10, "Salida neta").sort_values("Salida neta")
-        if not chart_source.empty:
-            fig = px.bar(chart_source, x="Salida neta", y="Producto", orientation="h", text_auto=",.0f", title="Top 10 SKU por salida neta a clientes", color_discrete_sequence=["#277da1"])
-            fig.update_layout(showlegend=False, yaxis_title="", xaxis_title=selected_uom)
-            st.plotly_chart(fig, width="stretch")
-
-        movement_show = coverage.sort_values(["Promedio diario", "Stock actual"], ascending=[False, True], na_position="last")[["Código", "Producto", "Unidad", "Stock actual", "Salidas", "Devoluciones", "Salida neta", "Promedio diario", "Cobertura días", "Última salida", "Días sin salida", "Movimientos", "Estado", "Acción"]]
-
-        def color_movement_rows(row):
-            colors = {
-                "🔴 Sin stock": "background-color:#fde2e1;color:#8a1c16;font-weight:600",
-                "🔴 Cobertura crítica": "background-color:#fde2e1;color:#8a1c16;font-weight:600",
-                "🟠 Cobertura baja": "background-color:#fff0dc;color:#8a4b08",
-                "⚪ Sin movimiento": "background-color:#f1f3f5;color:#495057",
-                "🟣 Sobreinventario": "background-color:#efe7fb;color:#5f3b8c",
-            }
-            return [colors.get(row["Estado"], "")] * len(row)
-
-        st.dataframe(movement_show.style.apply(color_movement_rows, axis=1), hide_index=True, width="stretch", column_config={
-            "Producto": st.column_config.TextColumn(width="large"),
-            "Stock actual": st.column_config.NumberColumn(format="%,.0f"),
-            "Salidas": st.column_config.NumberColumn(format="%,.0f"),
-            "Devoluciones": st.column_config.NumberColumn(format="%,.0f"),
-            "Salida neta": st.column_config.NumberColumn(format="%,.0f"),
-            "Promedio diario": st.column_config.NumberColumn(format="%,.1f"),
-            "Cobertura días": st.column_config.NumberColumn(format="%,.1f"),
-            "Última salida": st.column_config.DatetimeColumn(format="DD/MM/YYYY"),
-            "Acción": st.column_config.TextColumn(width="large"),
+        st.subheader("4. ¿De dónde vino la venta?")
+        channel_data = pd.DataFrame({
+            "Canal": ["Venta nacional", "Exportación", "Otra"],
+            "Venta": [snapshot["national"], snapshot["exports"], snapshot["other"]],
         })
+        channel_data = channel_data[channel_data["Venta"].abs() > .01]
+        channel_col, comparison_col = st.columns(2)
+        if not channel_data.empty:
+            channel_fig = px.pie(
+                channel_data, names="Canal", values="Venta", hole=.55,
+                color="Canal", color_discrete_map={"Venta nacional":"#277da1", "Exportación":"#43aa8b", "Otra":"#f4b942"},
+            )
+            channel_fig.update_traces(textposition="inside", textinfo="percent+label")
+            channel_fig.update_layout(title="Cada $100 vendidos, ¿de qué canal vinieron?", showlegend=False, height=360)
+            channel_col.plotly_chart(channel_fig, width="stretch")
+
+        comparison_rows = [{"Mes": f"{close_month_names[period.month]} {period.year}", "Venta": snapshot["net_sales"]}]
+        if previous_snapshot:
+            previous_period = period - 1
+            comparison_rows.append({"Mes": f"{close_month_names[previous_period.month]} {previous_period.year}", "Venta": previous_snapshot["net_sales"]})
+        if prior_year_snapshot:
+            comparison_rows.append({"Mes": f"{close_month_names[period.month]} {period.year - 1}", "Venta": prior_year_snapshot["net_sales"]})
+        comparison_data = pd.DataFrame(comparison_rows)
+        comparison_fig = px.bar(comparison_data, x="Mes", y="Venta", text_auto="$.3s", color="Mes", color_discrete_sequence=["#20639b", "#9fbad0", "#43aa8b"])
+        comparison_fig.update_layout(title="La misma regla para comparar meses", showlegend=False, height=360, yaxis_title="Dólares")
+        comparison_col.plotly_chart(comparison_fig, width="stretch")
+
+        st.subheader("5. ¿Quiénes ayudaron más?")
+        top_client_col, top_product_col = st.columns(2)
+        top_customers = pd.DataFrame(snapshot.get("top_customers", []))
+        top_products = pd.DataFrame(snapshot.get("top_products", []))
+        if not top_customers.empty:
+            customer_fig = px.bar(top_customers.sort_values("value"), x="value", y="name", orientation="h", text_auto="$.3s", color_discrete_sequence=["#277da1"])
+            customer_fig.update_layout(title="🏆 Clientes que más compraron", xaxis_title="Venta", yaxis_title="", height=350)
+            top_client_col.plotly_chart(customer_fig, width="stretch")
+        if not top_products.empty:
+            product_fig = px.bar(top_products.sort_values("value"), x="value", y="name", orientation="h", text_auto="$.3s", color_discrete_sequence=["#43aa8b"])
+            product_fig.update_layout(title="⭐ Productos que más vendieron", xaxis_title="Venta", yaxis_title="", height=350)
+            top_product_col.plotly_chart(product_fig, width="stretch")
+
+        st.subheader("6. Revisión antes de decir: “mes cerrado”")
+        checks = [
+            (abs(snapshot["billed"] - snapshot["credits"] - snapshot["net_sales"]) < .02, "Facturas menos notas de crédito es igual a la venta neta."),
+            (abs(snapshot["national"] + snapshot["exports"] + snapshot["other"] - snapshot["net_sales"]) < .02, "Nacional + exportación + otras ventas coincide con la venta neta."),
+            (snapshot.get("budget", 0) > 0, "El presupuesto del mes está cargado."),
+            (snapshot.get("has_credit_classification", False), "Las notas de crédito pueden identificarse correctamente."),
+            (snapshot.get("has_profitability", False), "Los costos están cargados para calcular la ganancia."),
+            (snapshot.get("cost_coverage", 0) >= .999, "Todos los SKU vendidos tienen un costo válido."),
+        ]
+        check_columns = st.columns(2)
+        for index, (passed, message) in enumerate(checks):
+            if passed:
+                check_columns[index % 2].success(f"✅ {message}")
+            else:
+                check_columns[index % 2].error(f"⚠️ {message}")
+
+        passed_checks = sum(int(passed) for passed, _ in checks)
+        if passed_checks == len(checks):
+            st.success("🎉 Todo concilia. Este mes está listo para cerrarse.")
+        else:
+            st.warning(f"🔎 Pasamos {passed_checks} de {len(checks)} revisiones. Corrige las alertas antes del cierre definitivo.")
+
+        st.subheader("7. La historia del mes en una frase")
+        goal_text = "superamos la meta" if compliance is not None and compliance >= 1 else "quedamos cerca de la meta" if compliance is not None and compliance >= .9 else "quedamos por debajo de la meta" if compliance is not None else "todavía no cargamos la meta"
+        growth_text = "vendimos más que el mes anterior" if month_growth is not None and month_growth >= 0 else "vendimos menos que el mes anterior" if month_growth is not None else "aún no tenemos un cierre anterior para comparar"
+        margin_text = f"el margen fue {snapshot['margin']:.1%}" if snapshot.get("margin") is not None else "falta cargar los costos para conocer el margen"
+        st.info(f"💡 En {close_month_names[period.month]} vendimos **{money(snapshot['net_sales'])}**, {goal_text}, {growth_text} y {margin_text}.")
 
 st.caption("Regla: el stock usa Cantidad disponible. Va lento si el avance está más de 10 puntos por debajo del tiempo transcurrido; va más rápido si está más de 10 puntos por encima.")
