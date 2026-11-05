@@ -381,7 +381,7 @@ def read_account_move_close(file):
 
     date_col = find("fecha", "factura")
     number_col = find("numero")
-    state_col = find("estado")
+    state_col = columns.get("estado") or find("estado")
     base_col = find("base", "imponible", "firmado")
     customer_col = find("nombre", "empresa", "mostrar", "factura")
     missing = [label for label, value in [
@@ -440,6 +440,65 @@ def read_account_move_close(file):
         "date_max": working["date"].max(),
     }
     return lines, summary
+
+
+def read_dislub_account_move(file):
+    """Validate one DISLUB account.move export and summarize its month."""
+    file_name = str(getattr(file, "name", "")).lower()
+    raw = pd.read_csv(file) if file_name.endswith(".csv") else pd.read_excel(file)
+    columns = {_plain_header(column): column for column in raw.columns}
+
+    def find(*terms):
+        return next((original for normalized, original in columns.items() if all(term in normalized for term in terms)), None)
+
+    date_col = find("fecha", "factura")
+    number_col = find("numero")
+    state_col = columns.get("estado") or find("estado")
+    base_col = find("base", "imponible", "firmado")
+    customer_col = find("nombre", "empresa", "mostrar", "factura")
+    missing = [label for label, value in [
+        ("Fecha de factura", date_col), ("Número", number_col), ("Estado", state_col),
+        ("Base imponible firmado", base_col), ("Cliente", customer_col),
+    ] if value is None]
+    if missing:
+        raise ValueError("Faltan columnas: " + ", ".join(missing))
+
+    data = raw[[date_col, number_col, state_col, base_col, customer_col]].copy()
+    data.columns = ["date", "invoice", "state", "amount", "customer"]
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data["amount"] = pd.to_numeric(data["amount"], errors="coerce")
+    data["customer"] = data["customer"].fillna("Cliente sin identificar").astype(str).str.strip()
+    data["state_key"] = data["state"].map(_plain_header)
+    data = data[data["date"].notna() & data["amount"].notna()].copy()
+    if data.empty:
+        raise ValueError("El archivo no contiene facturas válidas.")
+    months = sorted(data["date"].dt.to_period("M").astype(str).unique())
+    if len(months) != 1:
+        raise ValueError("Cada archivo debe contener un solo mes. Se encontraron: " + ", ".join(months))
+
+    cancelled_mask = data["state_key"].str.contains("cancel", na=False)
+    published = data[data["state_key"].isin(["publicado", "posted"])].copy()
+    if published.empty:
+        raise ValueError("No se encontraron documentos publicados.")
+    billed = float(published.loc[published["amount"].ge(0), "amount"].sum())
+    credits = float(published.loc[published["amount"].lt(0), "amount"].abs().sum())
+    clients = (
+        published.groupby("customer", as_index=False)["amount"].sum()
+        .rename(columns={"customer": "Cliente", "amount": "Venta"})
+        .sort_values("Venta", ascending=False)
+    )
+    return {
+        "month": months[0],
+        "date_min": data["date"].min(),
+        "date_max": data["date"].max(),
+        "published": int(len(published)),
+        "cancelled": int(cancelled_mask.sum()),
+        "cancelled_amount": float(data.loc[cancelled_mask, "amount"].abs().sum()),
+        "billed": billed,
+        "credits": credits,
+        "net_sales": billed - credits,
+        "clients": clients,
+    }
 
 
 def read_profitability_costs(file):
@@ -3109,9 +3168,9 @@ with tab10:
         st.caption("Ejemplo: septiembre. Cargue el archivo completo del mes.")
         dislub_previous_file = st.file_uploader(
             "Archivo DISLUB del mes anterior",
-            type=["xlsx", "xls", "csv", "pdf"],
+            type=["xlsx", "xls", "csv"],
             key=f"dislub_previous_{st.session_state.upload_generation}",
-            help="Puede cargar un Excel, CSV o PDF exportado para DISLUB.",
+            help="Cargue el Excel o CSV exportado desde Asientos contables de Odoo.",
         )
         if dislub_previous_file:
             st.success(f"✅ Recibido: {dislub_previous_file.name}")
@@ -3121,22 +3180,111 @@ with tab10:
         st.caption("Ejemplo: octubre. Cargue el archivo completo del mes.")
         dislub_current_file = st.file_uploader(
             "Archivo DISLUB del mes actual",
-            type=["xlsx", "xls", "csv", "pdf"],
+            type=["xlsx", "xls", "csv"],
             key=f"dislub_current_{st.session_state.upload_generation}",
-            help="Puede cargar un Excel, CSV o PDF exportado para DISLUB.",
+            help="Cargue el Excel o CSV exportado desde Asientos contables de Odoo.",
         )
         if dislub_current_file:
             st.success(f"✅ Recibido: {dislub_current_file.name}")
 
-    st.markdown("### ¿Qué mostrará este cierre?")
-    dislub_info_cols = st.columns(4)
-    dislub_info_cols[0].info("💵 Venta de cada mes")
-    dislub_info_cols[1].info("📦 Unidades por producto")
-    dislub_info_cols[2].info("📊 Barras comparativas")
-    dislub_info_cols[3].info("🟢 Creció · 🔴 Bajó · 🆕 Nuevo")
-
     if dislub_previous_file and dislub_current_file:
-        st.success("Los dos archivos están cargados. En cuanto validemos su estructura construiremos la comparación completa de DISLUB.")
+        try:
+            dislub_cuts = [
+                (dislub_previous_file.name, read_dislub_account_move(dislub_previous_file)),
+                (dislub_current_file.name, read_dislub_account_move(dislub_current_file)),
+            ]
+            dislub_cuts.sort(key=lambda item: item[1]["month"])
+            previous_name, previous_dislub = dislub_cuts[0]
+            current_name, current_dislub = dislub_cuts[1]
+            if previous_dislub["month"] == current_dislub["month"]:
+                raise ValueError("Los dos archivos corresponden al mismo mes.")
+
+            def dislub_month_label(month_key):
+                period_value = pd.Period(month_key, freq="M")
+                return f"{close_month_names[period_value.month]} {period_value.year}"
+
+            previous_dislub_label = dislub_month_label(previous_dislub["month"])
+            current_dislub_label = dislub_month_label(current_dislub["month"])
+            if previous_name != dislub_previous_file.name:
+                st.warning(
+                    f"Los archivos estaban en orden inverso. Los organicé automáticamente: "
+                    f"{previous_dislub_label} primero y {current_dislub_label} después."
+                )
+            else:
+                st.success(f"Meses validados: {previous_dislub_label} y {current_dislub_label}.")
+
+            dislub_difference = current_dislub["net_sales"] - previous_dislub["net_sales"]
+            dislub_growth = (
+                current_dislub["net_sales"] / previous_dislub["net_sales"] - 1
+                if previous_dislub["net_sales"] else None
+            )
+            st.markdown("### 1. Resultado comercial")
+            dislub_metrics = st.columns(4)
+            dislub_metrics[0].metric(previous_dislub_label, f"${previous_dislub['net_sales']:,.2f}")
+            dislub_metrics[1].metric(current_dislub_label, f"${current_dislub['net_sales']:,.2f}")
+            dislub_metrics[2].metric("Diferencia", f"${dislub_difference:,.2f}")
+            dislub_metrics[3].metric(
+                "Crecimiento",
+                f"{dislub_growth:+.1%}" if dislub_growth is not None else "Sin base",
+            )
+
+            st.markdown("### 2. Revisión de los archivos")
+            validation_cols = st.columns(4)
+            validation_cols[0].metric("Facturas publicadas anteriores", f"{previous_dislub['published']:,}")
+            validation_cols[1].metric("Facturas publicadas actuales", f"{current_dislub['published']:,}")
+            validation_cols[2].metric("Canceladas anteriores", f"{previous_dislub['cancelled']:,}")
+            validation_cols[3].metric("Canceladas actuales", f"{current_dislub['cancelled']:,}")
+
+            st.markdown("### 3. Comparación por cliente")
+            dislub_clients = previous_dislub["clients"].rename(columns={"Venta": previous_dislub_label}).merge(
+                current_dislub["clients"].rename(columns={"Venta": current_dislub_label}),
+                on="Cliente",
+                how="outer",
+            ).fillna(0)
+            dislub_clients["Diferencia"] = dislub_clients[current_dislub_label] - dislub_clients[previous_dislub_label]
+            dislub_clients["Cambio %"] = (
+                dislub_clients["Diferencia"] / dislub_clients[previous_dislub_label].replace(0, pd.NA)
+            )
+
+            def dislub_signal(row):
+                if row[previous_dislub_label] <= 0 and row[current_dislub_label] > 0:
+                    return "🆕 Nuevo"
+                if row[previous_dislub_label] > 0 and row[current_dislub_label] <= 0:
+                    return "⏸️ Sin venta"
+                if abs(row["Diferencia"]) < .01:
+                    return "🟡 Igual"
+                return "🟢 Creció" if row["Diferencia"] > 0 else "🔴 Bajó"
+
+            dislub_clients["Señal"] = dislub_clients.apply(dislub_signal, axis=1)
+            dislub_clients = dislub_clients.sort_values(current_dislub_label, ascending=False)
+            client_bar_max = max(
+                1.0,
+                float(dislub_clients[[previous_dislub_label, current_dislub_label]].max().max()),
+            )
+            st.dataframe(
+                dislub_clients[["Cliente", "Señal", previous_dislub_label, current_dislub_label, "Diferencia", "Cambio %"]],
+                hide_index=True,
+                width="stretch",
+                height=min(650, 110 + 38 * len(dislub_clients)),
+                column_config={
+                    "Cliente": st.column_config.TextColumn(width="large"),
+                    "Señal": st.column_config.TextColumn(width="medium"),
+                    previous_dislub_label: st.column_config.ProgressColumn(
+                        format="$%,.2f", min_value=0, max_value=client_bar_max, width="medium"
+                    ),
+                    current_dislub_label: st.column_config.ProgressColumn(
+                        format="$%,.2f", min_value=0, max_value=client_bar_max, width="medium"
+                    ),
+                    "Diferencia": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Cambio %": st.column_config.NumberColumn(format="%.1%%"),
+                },
+            )
+            st.info(
+                "Estos archivos de Asientos contables contienen facturas y clientes, pero no incluyen líneas de producto. "
+                "Para comparar unidades y SKU de DISLUB necesitaremos el reporte detallado de líneas de factura."
+            )
+        except Exception as exc:
+            st.error(f"No pude construir el cierre de DISLUB: {exc}")
     else:
         st.warning("Cargue los dos archivos para comenzar la comparación mensual de DISLUB.")
 
