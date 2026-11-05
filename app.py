@@ -551,10 +551,12 @@ def build_close_snapshot(month_key, budget, invoice_lines, cost_lines=None):
         top_source.groupby("customer", as_index=False)["net_sales"].sum()
         .nlargest(6, "net_sales").rename(columns={"customer": "name", "net_sales": "value"})
     )
-    product_top = (
-        top_source.groupby("code", as_index=False).agg(name=("product", "first"), value=("net_sales", "sum"))
-        .nlargest(6, "value")
+    product_detail = top_source.groupby("code", as_index=False).agg(
+        name=("product", "first"),
+        value=("net_sales", "sum"),
+        units=("quantity", "sum"),
     )
+    product_top = product_detail.nlargest(6, "value")
     return {
         "month": month_key,
         "saved_at": pd.Timestamp.now().isoformat(),
@@ -574,6 +576,7 @@ def build_close_snapshot(month_key, budget, invoice_lines, cost_lines=None):
         "invoice_count": int(invoices["invoice"].nunique()),
         "top_customers": customer_top.to_dict("records"),
         "top_products": product_top.to_dict("records"),
+        "products": product_detail.sort_values("value", ascending=False).to_dict("records"),
         "has_profitability": not valid_profit.empty,
         "has_credit_classification": "document_type" in invoice_lines.columns,
     }
@@ -1137,6 +1140,7 @@ if st.session_state.get("profit_storage_loaded") and st.session_state.get("close
         else pd.Timestamp.today().to_period("M")
     )
     auto_registered = []
+    auto_updated = []
     for history_key, history_cut in st.session_state.profit_store.get("months", {}).items():
         if "::" in history_key:
             continue
@@ -1144,27 +1148,39 @@ if st.session_state.get("profit_storage_loaded") and st.session_state.get("close
             history_period = pd.Period(history_key, freq="M")
         except (TypeError, ValueError):
             continue
-        if history_period >= active_period or history_key in st.session_state.close_store.get("months", {}):
+        existing_history = st.session_state.close_store.get("months", {}).get(history_key)
+        needs_product_detail = bool(existing_history) and not existing_history.get("products")
+        if (
+            history_period > active_period
+            or (history_period == active_period and not needs_product_detail)
+            or (existing_history and not needs_product_detail)
+        ):
             continue
         history_invoices = history_cut.get("invoices", pd.DataFrame())
         history_costs = history_cut.get("costs", pd.DataFrame())
         history_snapshot = build_close_snapshot(
             history_key,
-            DEFAULT_MONTHLY_BUDGETS.get(history_key, 0),
+            (existing_history or {}).get("budget", DEFAULT_MONTHLY_BUDGETS.get(history_key, 0)),
             history_invoices,
             history_costs,
         )
         if history_snapshot:
+            if existing_history:
+                history_snapshot["saved_at"] = existing_history.get("saved_at", history_snapshot["saved_at"])
             st.session_state.close_store.setdefault("months", {})[history_key] = history_snapshot
-            auto_registered.append(history_key)
-    if auto_registered:
+            (auto_updated if existing_history else auto_registered).append(history_key)
+    if auto_registered or auto_updated:
         st.session_state.close_storage_command = {
             "action": "save",
             "revision": uuid.uuid4().hex,
             "payload": pack_close_store(st.session_state.close_store),
         }
-        month_list = ", ".join(auto_registered)
-        st.session_state.close_notice = f"Se registraron automáticamente los cierres anteriores: {month_list}."
+        messages = []
+        if auto_registered:
+            messages.append(f"cierres registrados: {', '.join(auto_registered)}")
+        if auto_updated:
+            messages.append(f"detalle por producto agregado: {', '.join(auto_updated)}")
+        st.session_state.close_notice = "Se actualizó el histórico automáticamente: " + "; ".join(messages) + "."
         st.rerun()
 
 with st.sidebar:
@@ -2728,7 +2744,108 @@ with tab9:
             product_fig.update_layout(title="⭐ Productos que más vendieron", xaxis_title="Venta", yaxis_title="", height=350)
             top_product_col.plotly_chart(product_fig, width="stretch")
 
-        st.subheader("6. Revisión antes de decir: “mes cerrado”")
+        st.subheader("6. Producto por producto: ¿qué cambió?")
+        current_products = pd.DataFrame(snapshot.get("products", []))
+        previous_products = pd.DataFrame((previous_snapshot or {}).get("products", []))
+        if previous_snapshot and not current_products.empty and not previous_products.empty:
+            current_products = current_products.rename(columns={"name":"Producto actual", "value":"Venta actual", "units":"Unidades actuales"})
+            previous_products = previous_products.rename(columns={"name":"Producto anterior", "value":"Venta anterior", "units":"Unidades anteriores"})
+            product_comparison = previous_products.merge(current_products, on="code", how="outer")
+            product_comparison["Producto"] = product_comparison["Producto actual"].fillna(product_comparison["Producto anterior"]).fillna(product_comparison["code"])
+            for column in ["Venta anterior", "Venta actual", "Unidades anteriores", "Unidades actuales"]:
+                product_comparison[column] = pd.to_numeric(product_comparison[column], errors="coerce").fillna(0)
+            product_comparison["Diferencia $"] = product_comparison["Venta actual"] - product_comparison["Venta anterior"]
+            product_comparison["Cambio %"] = (
+                product_comparison["Diferencia $"] / product_comparison["Venta anterior"].replace(0, pd.NA)
+            )
+
+            def product_signal(row):
+                if row["Venta anterior"] <= 0 and row["Venta actual"] > 0:
+                    return "🆕 Nuevo"
+                if row["Venta anterior"] > 0 and row["Venta actual"] <= 0:
+                    return "⏸️ No se vendió"
+                if pd.isna(row["Cambio %"]) or abs(row["Cambio %"]) <= .05:
+                    return "🟡 Similar"
+                return "🟢 Creció" if row["Cambio %"] > 0 else "🔴 Bajó"
+
+            product_comparison["Señal"] = product_comparison.apply(product_signal, axis=1)
+            compare_left, compare_right = st.columns([1, 2])
+            compare_measure = compare_left.radio(
+                "¿Qué quieres comparar?",
+                ["Venta en dólares", "Unidades"],
+                horizontal=True,
+                key=f"close_product_measure_{selected_close_month}",
+            )
+            comparison_search = compare_right.text_input(
+                "Buscar producto o código",
+                key=f"close_product_search_{selected_close_month}",
+            )
+            visible_comparison = product_comparison.copy()
+            if comparison_search:
+                visible_comparison = visible_comparison[
+                    visible_comparison["code"].astype(str).str.contains(comparison_search, case=False, na=False)
+                    | visible_comparison["Producto"].astype(str).str.contains(comparison_search, case=False, na=False)
+                ]
+
+            previous_label = f"{close_month_names[(period - 1).month]} {(period - 1).year}"
+            current_label = f"{close_month_names[period.month]} {period.year}"
+            old_column, new_column = (
+                ("Venta anterior", "Venta actual")
+                if compare_measure == "Venta en dólares"
+                else ("Unidades anteriores", "Unidades actuales")
+            )
+            chart_products = visible_comparison.assign(
+                Total=lambda frame: frame[[old_column, new_column]].max(axis=1)
+            ).nlargest(15, "Total")
+            chart_data = chart_products[["Producto", old_column, new_column]].rename(
+                columns={old_column: previous_label, new_column: current_label}
+            ).melt(id_vars="Producto", var_name="Mes", value_name="Valor")
+            comparison_product_fig = px.bar(
+                chart_data,
+                x="Valor",
+                y="Producto",
+                color="Mes",
+                orientation="h",
+                barmode="group",
+                color_discrete_sequence=["#9fbad0", "#20639b"],
+                text_auto=".3s",
+            )
+            comparison_product_fig.update_layout(
+                title=f"{previous_label} frente a {current_label}",
+                xaxis_title=compare_measure,
+                yaxis_title="",
+                height=max(420, 34 * chart_products["Producto"].nunique()),
+                yaxis={"categoryorder":"total ascending"},
+            )
+            st.plotly_chart(comparison_product_fig, width="stretch")
+
+            comparison_table = visible_comparison.sort_values("Diferencia $", ascending=False).rename(columns={"code":"Código"})[[
+                "Código", "Producto", "Señal", "Unidades anteriores", "Unidades actuales",
+                "Venta anterior", "Venta actual", "Diferencia $", "Cambio %",
+            ]].copy()
+            comparison_table["Cambio %"] = comparison_table["Cambio %"].map(
+                lambda value: f"{value:+.1%}" if pd.notna(value) else "Nuevo"
+            )
+            st.dataframe(
+                comparison_table,
+                hide_index=True,
+                width="stretch",
+                height=min(620, 100 + 35 * len(comparison_table)),
+                column_config={
+                    "Producto": st.column_config.TextColumn(width="large"),
+                    "Unidades anteriores": st.column_config.NumberColumn(format="%,.2f"),
+                    "Unidades actuales": st.column_config.NumberColumn(format="%,.2f"),
+                    "Venta anterior": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Venta actual": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Diferencia $": st.column_config.NumberColumn(format="$%,.2f"),
+                },
+            )
+        elif previous_snapshot:
+            st.info("El cierre anterior existe, pero todavía no tiene el detalle de productos. Se completará automáticamente desde Rentabilidad al actualizar la página.")
+        else:
+            st.info("Cuando exista el cierre del mes anterior, aquí aparecerá la comparación completa de cada producto.")
+
+        st.subheader("7. Revisión antes de decir: “mes cerrado”")
         checks = [
             (abs(snapshot["billed"] - snapshot["credits"] - snapshot["net_sales"]) < .02, "Facturas menos notas de crédito es igual a la venta neta."),
             (abs(snapshot["national"] + snapshot["exports"] + snapshot["other"] - snapshot["net_sales"]) < .02, "Nacional + exportación + otras ventas coincide con la venta neta."),
@@ -2750,7 +2867,7 @@ with tab9:
         else:
             st.warning(f"🔎 Pasamos {passed_checks} de {len(checks)} revisiones. Corrige las alertas antes del cierre definitivo.")
 
-        st.subheader("7. La historia del mes en una frase")
+        st.subheader("8. La historia del mes en una frase")
         goal_text = "superamos la meta" if compliance is not None and compliance >= 1 else "quedamos cerca de la meta" if compliance is not None and compliance >= .9 else "quedamos por debajo de la meta" if compliance is not None else "todavía no cargamos la meta"
         growth_text = "vendimos más que el mes anterior" if month_growth is not None and month_growth >= 0 else "vendimos menos que el mes anterior" if month_growth is not None else "aún no tenemos un cierre anterior para comparar"
         margin_text = f"el margen fue {snapshot['margin']:.1%}" if snapshot.get("margin") is not None else "falta cargar los costos para conocer el margen"
