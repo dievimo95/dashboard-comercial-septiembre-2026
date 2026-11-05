@@ -1519,7 +1519,10 @@ if sold_forecast / forecast_total > elapsed:
 else:
     st.warning(f"En general vamos atrasados: se vendió {sold_forecast / forecast_total:.1%} del forecast y ha pasado {elapsed:.1%} del mes.")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente", "Pedido semanal", "Fill Rate", "Rentabilidad", "Cierre de mes"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    "Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente",
+    "Pedido semanal", "Fill Rate", "Rentabilidad", "Cierre de mes", "Cierre DISLUB",
+])
 
 with tab1:
     left, right = st.columns([1, 1])
@@ -3092,5 +3095,49 @@ with tab9:
         growth_text = "vendimos más que el mes anterior" if month_growth is not None and month_growth >= 0 else "vendimos menos que el mes anterior" if month_growth is not None else "aún no tenemos un cierre anterior para comparar"
         margin_text = f"el margen fue {snapshot['margin']:.1%}" if snapshot.get("margin") is not None else "falta cargar los costos para conocer el margen"
         st.info(f"💡 En {close_month_names[period.month]} vendimos **{money(snapshot['net_sales'])}**, {goal_text}, {growth_text} y {margin_text}.")
+
+with tab10:
+    st.markdown(
+        '<div class="close-title"><h2>🚚 Cierre mensual DISLUB</h2><p>Compare dos meses de DISLUB sin mezclar esta información con el cierre de ZICO.</p></div>',
+        unsafe_allow_html=True,
+    )
+    st.info("Los archivos cargados aquí pertenecen únicamente a DISLUB. Los cierres y archivos de ZICO no se modifican.")
+
+    dislub_left, dislub_right = st.columns(2)
+    with dislub_left:
+        st.markdown("### 1️⃣ Mes anterior")
+        st.caption("Ejemplo: septiembre. Cargue el archivo completo del mes.")
+        dislub_previous_file = st.file_uploader(
+            "Archivo DISLUB del mes anterior",
+            type=["xlsx", "xls", "csv", "pdf"],
+            key=f"dislub_previous_{st.session_state.upload_generation}",
+            help="Puede cargar un Excel, CSV o PDF exportado para DISLUB.",
+        )
+        if dislub_previous_file:
+            st.success(f"✅ Recibido: {dislub_previous_file.name}")
+
+    with dislub_right:
+        st.markdown("### 2️⃣ Mes actual")
+        st.caption("Ejemplo: octubre. Cargue el archivo completo del mes.")
+        dislub_current_file = st.file_uploader(
+            "Archivo DISLUB del mes actual",
+            type=["xlsx", "xls", "csv", "pdf"],
+            key=f"dislub_current_{st.session_state.upload_generation}",
+            help="Puede cargar un Excel, CSV o PDF exportado para DISLUB.",
+        )
+        if dislub_current_file:
+            st.success(f"✅ Recibido: {dislub_current_file.name}")
+
+    st.markdown("### ¿Qué mostrará este cierre?")
+    dislub_info_cols = st.columns(4)
+    dislub_info_cols[0].info("💵 Venta de cada mes")
+    dislub_info_cols[1].info("📦 Unidades por producto")
+    dislub_info_cols[2].info("📊 Barras comparativas")
+    dislub_info_cols[3].info("🟢 Creció · 🔴 Bajó · 🆕 Nuevo")
+
+    if dislub_previous_file and dislub_current_file:
+        st.success("Los dos archivos están cargados. En cuanto validemos su estructura construiremos la comparación completa de DISLUB.")
+    else:
+        st.warning("Cargue los dos archivos para comenzar la comparación mensual de DISLUB.")
 
 st.caption("Regla: el stock usa Cantidad disponible. Va lento si el avance está más de 10 puntos por debajo del tiempo transcurrido; va más rápido si está más de 10 puntos por encima.")
