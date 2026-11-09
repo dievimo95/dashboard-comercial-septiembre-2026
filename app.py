@@ -2212,6 +2212,14 @@ with tab6:
             st.session_state.storage_command = {"action": "save", "revision": uuid.uuid4().hex, "payload": pack_bundle(st.session_state.active_bundle)}
             st.rerun()
         order_analysis = analyze_weekly_order(weekly_order, forecast_df, stock_df, invoice_df)
+        # El cuadro principal analiza solamente los SKU del pedido. El detalle debe
+        # conservar el catálogo completo del forecast, incluso cuando el pedido no
+        # incluya un producto o haya un filtro de semáforo activo.
+        all_forecast_codes = forecast_df[["code"]].dropna().drop_duplicates().copy()
+        all_forecast_codes = all_forecast_codes.loc[all_forecast_codes["code"].astype(str).str.strip().ne("")]
+        all_forecast_order = all_forecast_codes.merge(weekly_order, on="code", how="left")
+        all_forecast_order["ordered"] = pd.to_numeric(all_forecast_order["ordered"], errors="coerce").fillna(0)
+        full_forecast_detail = analyze_weekly_order(all_forecast_order, forecast_df, stock_df, invoice_df)
         total_ordered = order_analysis["ordered"].sum()
         total_fitting = order_analysis["fits_forecast"].sum()
         total_outside = order_analysis["outside_forecast"].sum()
@@ -2268,12 +2276,13 @@ with tab6:
                 width="stretch", hide_index=True,
                 column_config={"Código": st.column_config.TextColumn(width="small"), "Producto": st.column_config.TextColumn(width="large"), "Resultado": st.column_config.TextColumn(width="medium")},
             )
-            with st.expander("Ver detalle de forecast, facturas y stock"):
-                detail_table = order_analysis[["code", "product", "forecast", "normal", "export", "other", "sold", "forecast_remaining", "ordered", "outside_forecast", "forecast_after_order", "available"]].rename(columns={
-                    "code": "Código", "product": "Producto", "forecast": "Forecast del mes", "normal": "Facturado nacional", "export": "Exportación (no resta)", "other": "Otras facturas", "sold": "Aplicado al forecast", "forecast_remaining": "Forecast libre", "ordered": "Pedido", "outside_forecast": "Faltan", "forecast_after_order": "Quedan", "available": "Stock informado",
-                })
-                numeric_columns = detail_table.select_dtypes(include="number").columns
-                st.dataframe(detail_table.style.format({column: show_units for column in numeric_columns}), width="stretch", hide_index=True, column_config={"Código": st.column_config.TextColumn()})
+        with st.expander("Ver detalle completo de forecast, facturas y stock"):
+            st.caption(f"Se muestran los {len(full_forecast_detail)} productos cargados en el forecast, aunque no estén incluidos en el pedido semanal.")
+            detail_table = full_forecast_detail[["code", "product", "forecast", "normal", "export", "other", "sold", "forecast_remaining", "ordered", "outside_forecast", "forecast_after_order", "available"]].rename(columns={
+                "code": "Código", "product": "Producto", "forecast": "Forecast del mes", "normal": "Facturado nacional", "export": "Exportación (no resta)", "other": "Otras facturas", "sold": "Aplicado al forecast", "forecast_remaining": "Forecast libre", "ordered": "Pedido", "outside_forecast": "Faltan", "forecast_after_order": "Quedan", "available": "Stock informado",
+            })
+            numeric_columns = detail_table.select_dtypes(include="number").columns
+            st.dataframe(detail_table.style.format({column: show_units for column in numeric_columns}), width="stretch", hide_index=True, column_config={"Código": st.column_config.TextColumn()})
         st.caption("Que el pedido quepa en el forecast no garantiza entrega inmediata: el stock puede ser parcial porque hay producción bajo pedido. El pedido no se descuenta ni se factura automáticamente. Si ya aparece en las facturas cargadas, no lo ingrese otra vez.")
     else:
         st.info("Cargue los pedidos y confirme sus códigos y cantidades para comparar el pedido con el forecast pendiente.")
