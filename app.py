@@ -2072,6 +2072,7 @@ with tab6:
                     else:
                         st.error(message)
                 if not pdf_lines.empty:
+                    pdf_lines.insert(0, "Incluir", True)
                     st.write(f"Se leyeron **{len(pdf_lines)} líneas** de **{len(order_pdfs)} archivos**; total provisional: **{pdf_lines['Unidades pedidas'].sum():,.0f} unidades**.")
                     order_summary = (
                         pdf_lines.groupby(["Cliente", "Orden"], dropna=False)
@@ -2080,7 +2081,7 @@ with tab6:
                     )
                     st.caption(f"Pedidos distintos detectados: {len(order_summary)}")
                     st.dataframe(order_summary, width="stretch", hide_index=True)
-                    st.caption("Rojo = producto cuyo SKU debe corregirse. Verde = SKU identificado. Puede editar 'Código SKU' y 'Unidades pedidas' en la tabla.")
+                    st.caption("Rojo = producto cuyo SKU debe corregirse. Verde = SKU identificado. Desmarque 'Incluir' para quitar una línea del análisis sin borrar el archivo.")
                     review_edits = st.session_state.get("pdf_order_review", {}).get("edited_rows", {})
                     current_codes = pdf_lines["Código SKU"].fillna("").astype(str).str.strip().copy()
                     for row_index, changes in review_edits.items():
@@ -2099,11 +2100,20 @@ with tab6:
                         colored_lines, width="stretch", hide_index=True, num_rows="fixed",
                         key="pdf_order_review",
                         disabled=["Cliente", "Orden", "Producto en pedido", "Referencia cliente", "Cajas", "Unidades por caja", "Archivo", "Revisión"],
-                        column_config={"Código SKU": st.column_config.TextColumn(help="Código interno de 8 dígitos"), "Unidades pedidas": st.column_config.NumberColumn(min_value=0, step=1)},
+                        column_config={
+                            "Incluir": st.column_config.CheckboxColumn(help="Desmarque para excluir esta línea del pedido", default=True),
+                            "Código SKU": st.column_config.TextColumn(help="Código interno de 8 dígitos"),
+                            "Unidades pedidas": st.column_config.NumberColumn(min_value=0, step=1),
+                        },
                     )
+                    included = edited_lines["Incluir"].fillna(False).astype(bool)
                     codes = edited_lines["Código SKU"].fillna("").astype(str).str.strip()
-                    invalid = codes.map(lambda code: not re.fullmatch(r"\d{8}", code))
-                    invalid_quantities = pd.to_numeric(edited_lines["Unidades pedidas"], errors="coerce").isna() | (pd.to_numeric(edited_lines["Unidades pedidas"], errors="coerce") <= 0)
+                    invalid = included & codes.map(lambda code: not re.fullmatch(r"\d{8}", code))
+                    numeric_quantities = pd.to_numeric(edited_lines["Unidades pedidas"], errors="coerce")
+                    invalid_quantities = included & (numeric_quantities.isna() | (numeric_quantities <= 0))
+                    excluded_count = int((~included).sum())
+                    if excluded_count:
+                        st.info(f"Se excluyeron **{excluded_count} líneas**. No se sumarán ni bloquearán la validación.")
                     if invalid.any():
                         st.warning(f"Faltan o son inválidos {int(invalid.sum())} códigos SKU. Corríjalos en la tabla antes de obtener el resultado completo.")
                         st.write("**Productos que necesitan un código:**")
@@ -2112,7 +2122,7 @@ with tab6:
                     if invalid_quantities.any():
                         st.error(f"Revise {int(invalid_quantities.sum())} cantidades vacías o no positivas.")
                     if not invalid.any() and not invalid_quantities.any() and not fatal_pdf_errors:
-                        weekly_order = prepare_weekly_order(edited_lines, "Código SKU", "Unidades pedidas")
+                        weekly_order = prepare_weekly_order(edited_lines.loc[included], "Código SKU", "Unidades pedidas")
             except Exception as exc:
                 st.error(f"No pude leer los PDF de pedidos: {exc}")
     elif entry_method == "Foto pedido Coral":
