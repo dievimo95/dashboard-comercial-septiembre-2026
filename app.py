@@ -1053,6 +1053,23 @@ def parse_order_pdfs(files, forecast, stock):
             pdf.close()
     result = pd.DataFrame(rows)
     if not result.empty:
+        # Un mismo pedido suele descargarse varias veces con nombres distintos.
+        # Evitamos sumar dos veces exactamente la misma línea de la misma orden.
+        identity_columns = [
+            "Cliente", "Orden", "Producto en pedido", "Referencia cliente",
+            "Cajas", "Unidades por caja", "Unidades pedidas",
+        ]
+        repeated = result.duplicated(subset=identity_columns, keep="first")
+        if repeated.any():
+            repeated_files = sorted(result.loc[repeated, "Archivo"].dropna().astype(str).unique())
+            repeated_orders = sorted(result.loc[repeated, "Orden"].dropna().astype(str).unique())
+            errors.append(
+                "AVISO_DUPLICADO: Se encontraron "
+                f"{int(repeated.sum())} líneas repetidas en {', '.join(repeated_files)}. "
+                f"Corresponden a la(s) misma(s) orden(es) {', '.join(repeated_orders)}; "
+                "se conservaron una sola vez para no duplicar cantidades."
+            )
+            result = result.loc[~repeated].reset_index(drop=True)
         result["Revisión"] = result.apply(
             lambda line: "Código de barras ambiguo: revise SKU" if not line["Código SKU"] and line["Referencia cliente"] in ambiguous_barcodes
             else "SKU no identificado: complete código" if not line["Código SKU"]
@@ -2048,10 +2065,21 @@ with tab6:
         if order_pdfs:
             try:
                 pdf_lines, pdf_errors = parse_order_pdfs(order_pdfs, forecast_df, stock_df)
+                fatal_pdf_errors = [message for message in pdf_errors if not message.startswith("AVISO_DUPLICADO:")]
                 for message in pdf_errors:
-                    st.error(message)
+                    if message.startswith("AVISO_DUPLICADO:"):
+                        st.warning(message.replace("AVISO_DUPLICADO:", "⚠️ PDF repetido:", 1))
+                    else:
+                        st.error(message)
                 if not pdf_lines.empty:
                     st.write(f"Se leyeron **{len(pdf_lines)} líneas** de **{len(order_pdfs)} archivos**; total provisional: **{pdf_lines['Unidades pedidas'].sum():,.0f} unidades**.")
+                    order_summary = (
+                        pdf_lines.groupby(["Cliente", "Orden"], dropna=False)
+                        .agg(Líneas=("Producto en pedido", "size"), Unidades=("Unidades pedidas", "sum"), Archivos=("Archivo", lambda values: ", ".join(sorted(set(map(str, values))))))
+                        .reset_index()
+                    )
+                    st.caption(f"Pedidos distintos detectados: {len(order_summary)}")
+                    st.dataframe(order_summary, width="stretch", hide_index=True)
                     st.caption("Rojo = producto cuyo SKU debe corregirse. Verde = SKU identificado. Puede editar 'Código SKU' y 'Unidades pedidas' en la tabla.")
                     review_edits = st.session_state.get("pdf_order_review", {}).get("edited_rows", {})
                     current_codes = pdf_lines["Código SKU"].fillna("").astype(str).str.strip().copy()
@@ -2083,7 +2111,7 @@ with tab6:
                             st.markdown(f":red[🔴 {pending['Producto en pedido']}] · {pending['Cliente']} · referencia {pending['Referencia cliente']}")
                     if invalid_quantities.any():
                         st.error(f"Revise {int(invalid_quantities.sum())} cantidades vacías o no positivas.")
-                    if not invalid.any() and not invalid_quantities.any() and not pdf_errors:
+                    if not invalid.any() and not invalid_quantities.any() and not fatal_pdf_errors:
                         weekly_order = prepare_weekly_order(edited_lines, "Código SKU", "Unidades pedidas")
             except Exception as exc:
                 st.error(f"No pude leer los PDF de pedidos: {exc}")
