@@ -1745,78 +1745,89 @@ with tab2:
         & alerts["sold"].lt(alerts["forecast"].fillna(0))
     )
 
+    def opportunity_type(row):
+        """Clasifica oportunidades que el equipo comercial sí puede ejecutar."""
+        if row["available"] <= 0:
+            return "Bloqueado por stock"
+        if row["is_slow"] and row["forecast_unsecured"] > 0:
+            return "Impulsar ahora"
+        if row["status"] == "Hay que venderlo":
+            return "Mover inventario"
+        if row["upcoming_order"] > 0 and row["forecast_unsecured"] > 0:
+            return "Asegurar pedido"
+        if row["status"] in ["Más rápido", "Meta cumplida"]:
+            return "Repetir lo que funciona"
+        if row["forecast_unsecured"] > 0:
+            return "Cerrar brecha"
+        return "Mantener"
+
+    alerts["opportunity_type"] = alerts.apply(opportunity_type, axis=1)
+
     def commercial_priority(row):
-        if row["confirmed_uncovered"] > 0:
-            return "CRÍTICO"
-        if row["available"] <= 0 and row["remaining"] > 0:
-            return "CRÍTICO"
-        if row["missing_stock"] > 0:
-            return "ALTO"
+        # El stock habilita una acción, pero no define por sí solo la prioridad.
+        if row["available"] <= 0:
+            return "BAJO"
         if row["is_slow"] and row["forecast_unsecured"] > 0:
             return "ALTO"
-        if row["status"] in ["Hay que venderlo", "Más rápido", "Revisar dato"]:
+        if row["status"] == "Hay que venderlo":
+            return "ALTO"
+        if row["upcoming_order"] > 0 and row["forecast_unsecured"] > 0:
+            return "MEDIO"
+        if row["status"] in ["Más rápido", "Meta cumplida"]:
             return "MEDIO"
         return "BAJO"
 
     alerts["commercial_priority"] = alerts.apply(commercial_priority, axis=1)
     priority_order = {"CRÍTICO": 0, "ALTO": 1, "MEDIO": 2, "BAJO": 3}
     alerts["priority_rank"] = alerts["commercial_priority"].map(priority_order).fillna(99)
-    alerts["impact_units"] = alerts[
-        ["confirmed_uncovered", "missing_stock", "forecast_unsecured", "available"]
-    ].max(axis=1)
+    alerts["sellable_opportunity"] = alerts[["forecast_unsecured", "available"]].min(axis=1).clip(lower=0)
+    alerts["impact_units"] = alerts["sellable_opportunity"]
 
     def priority_action(row):
-        if row["confirmed_uncovered"] > 0:
-            return (
-                f"URGENTE: cubrir {row['confirmed_uncovered']:,.0f} unidades "
-                "de pedidos confirmados sin stock suficiente."
-            )
-        if row["available"] <= 0 and row["remaining"] > 0:
-            return f"Sin stock. Reponer {row['remaining']:,.0f} unidades."
-        if row["missing_stock"] > 0:
-            return (
-                f"Reponer {row['missing_stock']:,.0f} unidades "
-                "para poder cumplir el forecast."
-            )
+        if row["available"] <= 0:
+            return "Sin inventario para vender hoy. Dejar fuera de la campaña comercial."
         if row["is_slow"] and row["forecast_unsecured"] > 0:
             return (
-                f"Impulsar venta. Quedan {row['forecast_unsecured']:,.0f} unidades "
-                "del forecast sin asegurar."
+                f"Impulsar con clientes y canales activos: hay {row['sellable_opportunity']:,.0f} "
+                "unidades disponibles para convertir en venta."
             )
         if row["status"] == "Hay que venderlo":
             return (
-                f"Activar venta/promoción. Hay {row['available']:,.0f} unidades "
-                "en inventario."
+                f"Crear promoción o venta cruzada para mover {row['available']:,.0f} unidades disponibles."
             )
+        if row["upcoming_order"] > 0 and row["forecast_unsecured"] > 0:
+            return f"Confirmar el pedido de {row['upcoming_order']:,.0f} unidades y buscar venta adicional."
         if row["status"] == "Más rápido":
-            return (
-                "Venta por encima del ritmo. Monitorear inventario y evitar "
-                "promoción agresiva."
-            )
+            return "Identificar cliente y canal ganador; repetir la acción comercial."
         if row["status"] == "Meta cumplida":
-            return "Meta cumplida. No requiere impulso comercial."
-        return row["action"]
+            return "Meta cumplida. Buscar recompra y venta cruzada sin descuento agresivo."
+        if row["forecast_unsecured"] > 0:
+            return f"Cerrar una brecha de {row['sellable_opportunity']:,.0f} unidades con clientes activos."
+        return "Mantener seguimiento comercial."
 
     alerts["priority_action"] = alerts.apply(priority_action, axis=1)
 
-    critical_skus = int((alerts["commercial_priority"] == "CRÍTICO").sum())
-    uncovered_units = float(alerts["confirmed_uncovered"].sum())
-    missing_units = float(alerts["missing_stock"].sum())
-    slow_skus = int(alerts["is_slow"].sum())
-    push_skus = int((alerts["status"] == "Hay que venderlo").sum())
+    actionable = alerts[alerts["available"].gt(0)].copy()
+    push_skus = int((actionable["commercial_priority"] == "ALTO").sum())
+    opportunity_units = float(actionable["sellable_opportunity"].sum())
+    slow_skus = int((actionable["is_slow"] & actionable["forecast_unsecured"].gt(0)).sum())
+    order_skus = int((actionable["upcoming_order"].gt(0) & actionable["forecast_unsecured"].gt(0)).sum())
+    success_skus = int(actionable["status"].isin(["Más rápido", "Meta cumplida"]).sum())
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("🔴 SKU críticos", f"{critical_skus:,}")
-    k2.metric("📦 Pedidos sin cobertura", f"{uncovered_units:,.0f} un.")
-    k3.metric("⚠️ Faltante para forecast", f"{missing_units:,.0f} un.")
-    k4.metric("📉 SKU atrasados", f"{slow_skus:,}")
-    k5.metric("📣 Hay que vender", f"{push_skus:,}")
+    k1.metric("🎯 Para impulsar ahora", f"{push_skus:,} SKU")
+    k2.metric("💰 Oportunidad vendible", f"{opportunity_units:,.0f} un.")
+    k3.metric("📉 Venta por acelerar", f"{slow_skus:,} SKU")
+    k4.metric("🤝 Pedidos por asegurar", f"{order_skus:,} SKU")
+    k5.metric("⭐ Éxitos para repetir", f"{success_skus:,} SKU")
 
     st.divider()
-    st.subheader("Prioridades de esta semana")
+    st.subheader("Oportunidades comerciales de esta semana")
+    st.caption("Primero aparecen productos que sí tienen inventario y una oportunidad concreta de venta. El stock es solo una condición de apoyo.")
 
     top_alerts = alerts[
-        alerts["commercial_priority"].isin(["CRÍTICO", "ALTO"])
+        alerts["commercial_priority"].isin(["ALTO", "MEDIO"])
+        & alerts["available"].gt(0)
     ].copy()
     top_alerts = top_alerts.sort_values(
         ["priority_rank", "impact_units"],
@@ -1831,27 +1842,24 @@ with tab2:
     }
 
     if top_alerts.empty:
-        st.success("No hay alertas críticas o altas en este corte.")
+        st.success("No hay oportunidades comerciales prioritarias en este corte.")
     else:
         top_alerts["Prioridad"] = top_alerts["commercial_priority"].map(priority_labels)
         top_show = top_alerts[
             [
-                "Prioridad", "code", "product", "status", "forecast", "sold",
-                "upcoming_order", "available", "confirmed_uncovered", "missing_stock",
-                "priority_action",
+                "Prioridad", "code", "product", "opportunity_type", "advance",
+                "forecast_unsecured", "sellable_opportunity", "available", "priority_action",
             ]
         ].rename(
             columns={
                 "code": "Código",
                 "product": "Producto",
-                "status": "Estado",
-                "forecast": "Forecast",
-                "sold": "Facturado",
-                "upcoming_order": "Pedido por venir",
-                "available": "Stock",
-                "confirmed_uncovered": "Pedido sin cobertura",
-                "missing_stock": "Stock faltante",
-                "priority_action": "Acción inmediata",
+                "opportunity_type": "Oportunidad",
+                "advance": "Avance",
+                "forecast_unsecured": "Meta pendiente",
+                "sellable_opportunity": "Venta posible hoy",
+                "available": "Inventario disponible",
+                "priority_action": "Acción comercial",
             }
         )
         st.dataframe(
@@ -1861,34 +1869,36 @@ with tab2:
             column_config={
                 "Código": st.column_config.TextColumn(),
                 "Producto": st.column_config.TextColumn(width="large"),
-                "Forecast": st.column_config.NumberColumn(format="%,.0f"),
-                "Facturado": st.column_config.NumberColumn(format="%,.0f"),
-                "Pedido por venir": st.column_config.NumberColumn(format="%,.0f"),
-                "Stock": st.column_config.NumberColumn(format="%,.0f"),
-                "Pedido sin cobertura": st.column_config.NumberColumn(format="%,.0f"),
-                "Stock faltante": st.column_config.NumberColumn(format="%,.0f"),
-                "Acción inmediata": st.column_config.TextColumn(width="large"),
+                "Avance": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=1),
+                "Meta pendiente": st.column_config.NumberColumn(format="%,.0f"),
+                "Venta posible hoy": st.column_config.NumberColumn(format="%,.0f"),
+                "Inventario disponible": st.column_config.NumberColumn(format="%,.0f"),
+                "Acción comercial": st.column_config.TextColumn(width="large"),
             },
         )
 
     st.divider()
-    st.subheader("Detalle de alertas")
+    st.subheader("Explorar oportunidades")
 
     f1, f2 = st.columns(2)
     with f1:
         selected_priorities = st.multiselect(
-            "Prioridad",
-            ["CRÍTICO", "ALTO", "MEDIO", "BAJO"],
-            default=["CRÍTICO", "ALTO", "MEDIO"],
+            "Prioridad comercial",
+            ["ALTO", "MEDIO", "BAJO"],
+            default=["ALTO", "MEDIO"],
             key="action_priority_filter",
         )
     with f2:
-        selected_status = st.multiselect(
-            "Estado",
-            list(COLORS),
+        selected_opportunities = st.multiselect(
+            "Tipo de oportunidad",
+            [
+                "Impulsar ahora", "Mover inventario", "Asegurar pedido",
+                "Repetir lo que funciona", "Cerrar brecha", "Mantener",
+                "Bloqueado por stock",
+            ],
             default=[
-                "No hay stock", "Falta stock", "Va lento",
-                "Hay que venderlo", "Más rápido",
+                "Impulsar ahora", "Mover inventario", "Asegurar pedido",
+                "Repetir lo que funciona", "Cerrar brecha",
             ],
             key="action_status_filter",
         )
@@ -1900,7 +1910,7 @@ with tab2:
 
     detail = alerts[
         alerts["commercial_priority"].isin(selected_priorities)
-        & alerts["status"].isin(selected_status)
+        & alerts["opportunity_type"].isin(selected_opportunities)
     ].copy()
 
     if search_action:
@@ -1916,23 +1926,23 @@ with tab2:
     detail["Prioridad"] = detail["commercial_priority"].map(priority_labels)
     detail_show = detail[
         [
-            "Prioridad", "status", "code", "product", "forecast", "sold",
-            "upcoming_order", "forecast_unsecured", "available",
-            "confirmed_uncovered", "missing_stock", "priority_action",
+            "Prioridad", "opportunity_type", "code", "product", "advance",
+            "forecast", "sold", "upcoming_order", "forecast_unsecured",
+            "sellable_opportunity", "available", "priority_action",
         ]
     ].rename(
         columns={
-            "status": "Estado",
+            "opportunity_type": "Oportunidad",
             "code": "Código",
             "product": "Producto",
+            "advance": "Avance",
             "forecast": "Forecast",
             "sold": "Facturado",
             "upcoming_order": "Pedido por venir",
-            "forecast_unsecured": "Forecast sin asegurar",
-            "available": "Stock",
-            "confirmed_uncovered": "Pedido sin cobertura",
-            "missing_stock": "Stock faltante",
-            "priority_action": "Qué hacer",
+            "forecast_unsecured": "Meta pendiente",
+            "sellable_opportunity": "Venta posible hoy",
+            "available": "Inventario disponible",
+            "priority_action": "Acción comercial",
         }
     )
 
@@ -1943,14 +1953,14 @@ with tab2:
         column_config={
             "Código": st.column_config.TextColumn(),
             "Producto": st.column_config.TextColumn(width="large"),
+            "Avance": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=1),
             "Forecast": st.column_config.NumberColumn(format="%,.0f"),
             "Facturado": st.column_config.NumberColumn(format="%,.0f"),
             "Pedido por venir": st.column_config.NumberColumn(format="%,.0f"),
-            "Forecast sin asegurar": st.column_config.NumberColumn(format="%,.0f"),
-            "Stock": st.column_config.NumberColumn(format="%,.0f"),
-            "Pedido sin cobertura": st.column_config.NumberColumn(format="%,.0f"),
-            "Stock faltante": st.column_config.NumberColumn(format="%,.0f"),
-            "Qué hacer": st.column_config.TextColumn(width="large"),
+            "Meta pendiente": st.column_config.NumberColumn(format="%,.0f"),
+            "Venta posible hoy": st.column_config.NumberColumn(format="%,.0f"),
+            "Inventario disponible": st.column_config.NumberColumn(format="%,.0f"),
+            "Acción comercial": st.column_config.TextColumn(width="large"),
         },
     )
 
