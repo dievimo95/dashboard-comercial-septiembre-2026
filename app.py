@@ -1970,7 +1970,15 @@ with tab2:
     )
 
 with tab3:
-    search = st.text_input("Buscar código o producto")
+    search_col, sort_col = st.columns([3, 1])
+    with search_col:
+        search = st.text_input("Buscar código o producto")
+    with sort_col:
+        product_sort = st.selectbox(
+            "Ordenar productos por",
+            ["Orden actual", "Mayor avance", "Menor avance"],
+            key="all_products_sort",
+        )
     full = analysis.copy()
     upcoming_order = st.session_state.current_weekly_order
     if not upcoming_order.empty:
@@ -1981,6 +1989,10 @@ with tab3:
     full["forecast_after_upcoming"] = full["forecast"].fillna(0) - full["sold"] - full["upcoming_order"]
     if search:
         full = full[full["code"].str.contains(search, case=False, na=False) | full["product"].str.contains(search, case=False, na=False)]
+    if product_sort == "Mayor avance":
+        full = full.sort_values(["advance", "product"], ascending=[False, True], na_position="last")
+    elif product_sort == "Menor avance":
+        full = full.sort_values(["advance", "product"], ascending=[True, True], na_position="last")
     # Mantener el avance como valor numérico permite mostrar una barra visual
     # y el porcentaje en la misma celda, igual que en Oportunidades comerciales.
     full["Avance"] = pd.to_numeric(full["advance"], errors="coerce") * 100
