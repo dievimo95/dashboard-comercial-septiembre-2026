@@ -1200,6 +1200,8 @@ if st.session_state.get("app_data_version") != APP_DATA_VERSION:
         st.session_state.pop(stale_key, None)
 if "upload_generation" not in st.session_state:
     st.session_state.upload_generation = 0
+if "weekly_order_generation" not in st.session_state:
+    st.session_state.weekly_order_generation = 0
 if "current_weekly_order" not in st.session_state:
     st.session_state.current_weekly_order = st.session_state.active_bundle.get("weekly_order", pd.DataFrame(columns=["code", "ordered"])).copy()
 if "storage_command" not in st.session_state:
@@ -1363,6 +1365,7 @@ with st.sidebar:
             st.session_state.active_bundle = blank_bundle()
             st.session_state.current_weekly_order = pd.DataFrame(columns=["code", "ordered"])
             st.session_state.pop("current_weekly_order_signature", None)
+            st.session_state.weekly_order_generation += 1
             st.session_state.storage_loaded = True
             st.session_state.storage_command = {"action": "clear", "revision": uuid.uuid4().hex, "payload": ""}
             st.session_state.upload_generation += 1
@@ -1387,6 +1390,7 @@ with st.sidebar:
             st.session_state.profit_store = blank_profit_store()
             st.session_state.close_store = blank_close_store()
             st.session_state.current_weekly_order = pd.DataFrame(columns=["code", "ordered"])
+            st.session_state.weekly_order_generation += 1
             st.session_state.storage_loaded = True
             st.session_state.profit_storage_loaded = True
             st.session_state.close_storage_loaded = True
@@ -2067,10 +2071,45 @@ with tab5:
 with tab6:
     st.subheader("¿Cabe el pedido de esta semana en el forecast?")
     st.caption("Forecast pendiente = forecast del mes − facturación nacional. Las facturas de exportación (001-901) se muestran aparte y no consumen forecast. Todas las cantidades son unidades individuales.")
+    saved_weekly_order = st.session_state.get(
+        "current_weekly_order",
+        pd.DataFrame(columns=["code", "ordered"]),
+    )
+    if not saved_weekly_order.empty:
+        delivered_units = pd.to_numeric(
+            saved_weekly_order.get("ordered", pd.Series(dtype=float)),
+            errors="coerce",
+        ).fillna(0).sum()
+        notice_col, action_col = st.columns([3, 1])
+        notice_col.info(
+            f"Hay un pedido activo de {delivered_units:,.0f} unidades. "
+            "Mientras siga activo aparecerá como 'Pedido por venir' en el dashboard."
+        )
+        if action_col.button(
+            "✅ Marcar como entregado",
+            type="primary",
+            use_container_width=True,
+            help="Quita el pedido por venir sin borrar facturas, forecast ni stock.",
+        ):
+            st.session_state.current_weekly_order = pd.DataFrame(columns=["code", "ordered"])
+            st.session_state.active_bundle["weekly_order"] = pd.DataFrame(columns=["code", "ordered"])
+            st.session_state.pop("current_weekly_order_signature", None)
+            st.session_state.weekly_order_generation += 1
+            st.session_state.storage_command = {
+                "action": "save",
+                "revision": uuid.uuid4().hex,
+                "payload": pack_bundle(st.session_state.active_bundle),
+            }
+            st.session_state.storage_notice = (
+                "Pedido marcado como entregado. 'Pedido por venir' ahora está en cero."
+            )
+            st.rerun()
+
+    weekly_generation = st.session_state.weekly_order_generation
     entry_method = st.radio("Cómo ingresar el pedido", ["Subir PDF de clientes", "Foto pedido Coral", "Subir Excel o CSV", "Escribir pedido"], horizontal=True)
     weekly_order = pd.DataFrame(columns=["code", "ordered"])
     if entry_method == "Subir PDF de clientes":
-        order_pdfs = st.file_uploader("Pedidos de TIA, El Rosado o Supermaxi (.pdf)", type="pdf", accept_multiple_files=True, key="weekly_order_pdfs")
+        order_pdfs = st.file_uploader("Pedidos de TIA, El Rosado o Supermaxi (.pdf)", type="pdf", accept_multiple_files=True, key=f"weekly_order_pdfs_{weekly_generation}")
         st.caption("Puede cargar varios pedidos a la vez. La aplicación convierte cajas × unidades por caja y muestra los SKU para revisión antes de analizar.")
         if order_pdfs:
             try:
@@ -2092,7 +2131,8 @@ with tab6:
                     st.caption(f"Pedidos distintos detectados: {len(order_summary)}")
                     st.dataframe(order_summary, width="stretch", hide_index=True)
                     st.caption("Rojo = producto cuyo SKU debe corregirse. Verde = SKU identificado. Desmarque 'Incluir' para quitar una línea del análisis sin borrar el archivo.")
-                    review_edits = st.session_state.get("pdf_order_review", {}).get("edited_rows", {})
+                    pdf_review_key = f"pdf_order_review_{weekly_generation}"
+                    review_edits = st.session_state.get(pdf_review_key, {}).get("edited_rows", {})
                     current_codes = pdf_lines["Código SKU"].fillna("").astype(str).str.strip().copy()
                     for row_index, changes in review_edits.items():
                         if "Código SKU" in changes:
@@ -2108,7 +2148,7 @@ with tab6:
                     )
                     edited_lines = st.data_editor(
                         colored_lines, width="stretch", hide_index=True, num_rows="fixed",
-                        key="pdf_order_review",
+                        key=pdf_review_key,
                         disabled=["Cliente", "Orden", "Producto en pedido", "Referencia cliente", "Cajas", "Unidades por caja", "Archivo", "Revisión"],
                         column_config={
                             "Incluir": st.column_config.CheckboxColumn(help="Desmarque para excluir esta línea del pedido", default=True),
@@ -2139,7 +2179,7 @@ with tab6:
         coral_image = st.file_uploader(
             "Foto del pedido de Coral (.jpg, .jpeg o .png)",
             type=["jpg", "jpeg", "png"],
-            key="coral_order_image",
+            key=f"coral_order_image_{weekly_generation}",
         )
         st.caption("La app leerá PRODUCTO + CANTIDAD, buscará el SKU más parecido en su forecast/stock y le permitirá corregirlo antes de usar el pedido.")
         if coral_image is not None:
@@ -2162,7 +2202,7 @@ with tab6:
                     width="stretch",
                     hide_index=True,
                     num_rows="fixed",
-                    key="coral_order_review",
+                    key=f"coral_order_review_{weekly_generation}",
                     disabled=["Cliente", "Producto leído", "Producto identificado", "Coincidencia", "Revisión"],
                     column_config={
                         "Cantidad": st.column_config.NumberColumn(min_value=1, step=1, format="%,.0f"),
@@ -2185,7 +2225,7 @@ with tab6:
                 st.error(f"No pude leer la foto del pedido de Coral: {exc}")
 
     elif entry_method == "Subir Excel o CSV":
-        order_file = st.file_uploader("Pedido semanal (.xlsx o .csv)", type=["xlsx", "csv"], key="weekly_order_file")
+        order_file = st.file_uploader("Pedido semanal (.xlsx o .csv)", type=["xlsx", "csv"], key=f"weekly_order_file_{weekly_generation}")
         st.caption("El archivo debe incluir una columna de código de producto y otra de cantidad solicitada. Puede elegirlas abajo.")
         if order_file is not None:
             try:
@@ -2208,7 +2248,7 @@ with tab6:
     else:
         typed_order = st.data_editor(
             pd.DataFrame({"Código": [""], "Cantidad": [None]}),
-            num_rows="dynamic", hide_index=True, width="stretch", key="weekly_order_editor",
+            num_rows="dynamic", hide_index=True, width="stretch", key=f"weekly_order_editor_{weekly_generation}",
             column_config={"Código": st.column_config.TextColumn(help="Código/SKU de 8 dígitos"), "Cantidad": st.column_config.NumberColumn(min_value=1, step=1)},
         )
         weekly_order = prepare_weekly_order(typed_order, "Código", "Cantidad")
