@@ -1980,16 +1980,16 @@ with tab3:
     full["forecast_after_upcoming"] = full["forecast"].fillna(0) - full["sold"] - full["upcoming_order"]
     if search:
         full = full[full["code"].str.contains(search, case=False, na=False) | full["product"].str.contains(search, case=False, na=False)]
-    full["Avance"] = full["advance"].map(
-        lambda value: "—" if pd.isna(value) else f"{value:.1%}".replace(".", ",").replace("%", " %")
-    )
+    # Mantener el avance como valor numérico permite mostrar una barra visual
+    # y el porcentaje en la misma celda, igual que en Oportunidades comerciales.
+    full["Avance"] = pd.to_numeric(full["advance"], errors="coerce")
     show = full[["code", "product", "forecast", "sold", "upcoming_order", "forecast_after_upcoming", "Avance", "available", "status", "action"]].rename(columns={"code":"Código", "product":"Producto", "forecast":"Forecast", "sold":"Facturado", "upcoming_order":"Pedido por venir", "forecast_after_upcoming":"Saldo tras pedido", "available":"Stock", "status":"Estado", "action":"Qué hacer"})
     styled_show = show.style.apply(
         lambda column: ["background-color: #e8f3ff; color: #174f7a; font-weight: 700" if show["Pedido por venir"].iloc[position] > 0 else "" for position in range(len(column))],
         subset=["Pedido por venir", "Saldo tras pedido"],
     )
     st.caption("Pedido por venir = pedidos cargados y confirmados en la pestaña Pedido semanal. Saldo tras pedido = forecast − facturado − pedido.")
-    st.dataframe(styled_show, width="stretch", hide_index=True, column_config={"Código": st.column_config.TextColumn(), "Producto": st.column_config.TextColumn(width="large"), "Avance": st.column_config.TextColumn(width="small"), "Forecast": st.column_config.NumberColumn(format="%,.0f"), "Facturado": st.column_config.NumberColumn(format="%,.0f"), "Pedido por venir": st.column_config.NumberColumn(format="%,.0f"), "Saldo tras pedido": st.column_config.NumberColumn(format="%,.0f"), "Stock": st.column_config.NumberColumn(format="%,.0f")})
+    st.dataframe(styled_show, width="stretch", hide_index=True, column_config={"Código": st.column_config.TextColumn(), "Producto": st.column_config.TextColumn(width="large"), "Avance": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=1, width="medium"), "Forecast": st.column_config.NumberColumn(format="%,.0f"), "Facturado": st.column_config.NumberColumn(format="%,.0f"), "Pedido por venir": st.column_config.NumberColumn(format="%,.0f"), "Saldo tras pedido": st.column_config.NumberColumn(format="%,.0f"), "Stock": st.column_config.NumberColumn(format="%,.0f")})
 
 with tab4:
     weekly = invoice_df.groupby("week", as_index=False).agg(Unidades=("quantity", "sum"), Venta_neta=("net_sales", "sum"))
