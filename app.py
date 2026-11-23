@@ -903,16 +903,24 @@ def order_number(value):
 def tia_mappings(pdf):
     client_to_sku, barcode_to_sku = {}, {}
     for page in pdf.pages:
+        # Los PDF nuevos de TIA imprimen la homologación como texto corrido:
+        # código TIA (9) + descripción + código de barras (13) + SKU (8).
+        # Leer este bloque por patrón evita depender de posiciones de columnas.
+        text = page.extract_text() or ""
+        for match in re.finditer(r"(?m)^(\d{9})\s+.*?\s+(\d{13})\s+(\d{8})\b", text):
+            client, barcode, sku = match.groups()
+            if sku != client:
+                client_to_sku[client] = sku
+                barcode_to_sku[barcode] = sku
         for table in page.extract_tables():
             for row in table:
-                if len(row) < 10:
-                    continue
-                client = re.sub(r"\D", "", str(row[0] or ""))
-                barcode = re.sub(r"\D", "", str(row[5] or ""))
-                sku = re.sub(r"\D", "", str(row[7] or ""))
-                if len(client) == 9 and len(sku) == 8 and sku != client:
+                numbers = [re.sub(r"\D", "", str(cell or "")) for cell in row]
+                client = next((value for value in numbers if len(value) == 9), "")
+                barcode = next((value for value in numbers if len(value) == 13), "")
+                sku = next((value for value in numbers if len(value) == 8), "")
+                if client and barcode and sku and sku != client:
                     client_to_sku[client] = sku
-                    if len(barcode) == 13:
+                    if barcode:
                         barcode_to_sku[barcode] = sku
     return client_to_sku, barcode_to_sku
 
@@ -924,6 +932,7 @@ def parse_order_pdfs(files, forecast, stock):
         "7862123515891": "01020019", "7862123513842": "03020007",
         "7862123515495": "01020014", "7862123510391": "01020002",
         "7862123516430": "13020001", "7862123516447": "13020002",
+        "7862123514139": "01020020",
     }
     barcode_candidates = {}
     for catalog in [forecast, stock]:
@@ -954,6 +963,12 @@ def parse_order_pdfs(files, forecast, stock):
         client_to_sku.update(tia)
         barcode_to_sku.update(barcodes)
         for page in pdf.pages:
+            mapping_text = page.extract_text() or ""
+            for match in re.finditer(r"(?m)^(\d{9})\s+.*?\s+(\d{13})\s+(\d{8,9})\b", mapping_text):
+                client, barcode, provider_code = match.groups()
+                sku = provider_code if len(provider_code) == 8 else barcode_to_sku.get(barcode, "")
+                if sku:
+                    client_to_sku[client] = sku
             for table in page.extract_tables():
                 for line in table:
                     if len(line) < 8:
@@ -969,26 +984,51 @@ def parse_order_pdfs(files, forecast, stock):
             found = 0
             for page_no, page in enumerate(pdf.pages, 1):
                 text = page.extract_text() or ""
-                if "Resultado De La Homologación" in text or "TIENDAS INDUSTRIALES ASOCIADAS" in text:
-                    order_match = re.search(r"ORDEN DE COMPRA N[º°]\s*(\d+)", text)
+                if "TIENDAS INDUSTRIALES ASOCIADAS" in text:
+                    order_match = re.search(r"N[º°]\s*(\d{8,})", text)
                     order_id = order_match.group(1) if order_match else f"página {page_no}"
-                    window = re.search(r"Desde El:\s*Hasta El:\s*(\d{4}-\d{2}-\d{2})\s+(\d{4}-\d{2}-\d{2})", text)
+                    window = (
+                        re.search(r"Desde El:\s*Hasta El:\s*(\d{4}-\d{2}-\d{2})\s+(\d{4}-\d{2}-\d{2})", text)
+                        or re.search(r"Desde El:\s*(\d{4}-\d{2}-\d{2})\s*Hasta El:\s*(\d{4}-\d{2}-\d{2})", text)
+                    )
                     loaded = re.search(r"Fecha Carga:(\d{4}-\d{2}-\d{2})", text)
                     order_date = pd.to_datetime(loaded.group(1)) if loaded else pd.NaT
                     start_date = pd.to_datetime(window.group(1)) if window else pd.NaT
                     end_date = pd.to_datetime(window.group(2)) if window else pd.NaT
                     for table in page.extract_tables():
                         for line in table:
-                            if len(line) < 11:
+                            cells = [str(cell or "").strip() for cell in line]
+                            client_positions = [
+                                position for position, cell in enumerate(cells)
+                                if len(re.sub(r"\D", "", cell)) == 9
+                                and re.fullmatch(r"\s*\d{9}\s*", cell)
+                            ]
+                            if not client_positions:
                                 continue
-                            client_code = re.sub(r"\D", "", str(line[10] or ""))
+                            client_position = client_positions[0]
+                            client_code = re.sub(r"\D", "", cells[client_position])
+                            numeric_before = []
+                            for position, cell in enumerate(cells[:client_position]):
+                                try:
+                                    numeric_before.append((position, order_number(cell)))
+                                except (ValueError, TypeError):
+                                    pass
+                            if not numeric_before:
+                                continue
                             try:
-                                units = order_number(line[0])
+                                units = numeric_before[0][1]
                             except (ValueError, TypeError):
                                 continue
                             if len(client_code) != 9 or units <= 0:
                                 continue
-                            rows.append({"Cliente": "TIA", "Orden": canonical_order(order_id), "Fecha pedido": order_date, "Fecha inicio": start_date, "Fecha límite": end_date, "Producto en pedido": str(line[6] or "").replace("\n", " "), "Referencia cliente": client_code, "Cajas": order_number(line[1]) if line[1] else None, "Unidades por caja": None, "Unidades pedidas": units, "Código SKU": client_to_sku.get(client_code, ""), "Archivo": filename})
+                            descriptions = [
+                                cell.replace("\n", " ") for cell in cells[:client_position]
+                                if cell and re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]", cell)
+                            ]
+                            description = max(descriptions, key=len) if descriptions else ""
+                            boxes = numeric_before[1][1] if len(numeric_before) > 1 else None
+                            units_per_case = units / boxes if boxes else None
+                            rows.append({"Cliente": "TIA", "Orden": canonical_order(order_id), "Fecha pedido": order_date, "Fecha inicio": start_date, "Fecha límite": end_date, "Producto en pedido": description, "Referencia cliente": client_code, "Cajas": boxes, "Unidades por caja": units_per_case, "Unidades pedidas": units, "Código SKU": client_to_sku.get(client_code, ""), "Archivo": filename})
                             found += 1
                 elif "CORPORACION EL ROSADO" in text:
                     for table in page.extract_tables():
