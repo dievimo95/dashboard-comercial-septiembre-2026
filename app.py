@@ -1233,6 +1233,57 @@ def validate_bundle(forecast_data, stock_data, invoice_data, new_invoice_data=No
     return errors, warnings
 
 
+# Dos controles comerciales dentro de la misma aplicación. Cada empresa usa
+# claves de navegador distintas para evitar que forecast, stock, facturas,
+# pedidos, rentabilidad o cierres se mezclen entre sí.
+commercial_company = st.sidebar.radio(
+    "Empresa",
+    ["ZICO", "DISLUB"],
+    horizontal=True,
+    key="commercial_company",
+)
+company_slug = commercial_company.lower()
+commercial_storage_key = (
+    "control-comercial-corte-v1"
+    if commercial_company == "ZICO"
+    else "control-comercial-corte-dislub-v1"
+)
+profit_storage_key = (
+    "control-comercial-rentabilidad-v1"
+    if commercial_company == "ZICO"
+    else "control-comercial-rentabilidad-dislub-v1"
+)
+close_storage_key = (
+    "control-comercial-cierres-v1"
+    if commercial_company == "ZICO"
+    else "control-comercial-cierres-dislub-v1"
+)
+company_monthly_budgets = DEFAULT_MONTHLY_BUDGETS if commercial_company == "ZICO" else {}
+
+if "loaded_commercial_company" not in st.session_state:
+    st.session_state.loaded_commercial_company = commercial_company
+elif st.session_state.loaded_commercial_company != commercial_company:
+    st.session_state.loaded_commercial_company = commercial_company
+    st.session_state.active_bundle = blank_bundle()
+    st.session_state.current_weekly_order = pd.DataFrame(columns=["code", "ordered"])
+    st.session_state.profit_store = blank_profit_store()
+    st.session_state.close_store = blank_close_store()
+    st.session_state.storage_command = {"action": "load", "revision": f"load-{company_slug}-{uuid.uuid4().hex}", "payload": ""}
+    st.session_state.profit_storage_command = {"action": "load", "revision": f"load-profit-{company_slug}-{uuid.uuid4().hex}", "payload": ""}
+    st.session_state.close_storage_command = {"action": "load", "revision": f"load-close-{company_slug}-{uuid.uuid4().hex}", "payload": ""}
+    for key in [
+        "storage_loaded", "profit_storage_loaded", "close_storage_loaded",
+        "validated_bundle", "validation_summary", "validated_signature",
+        "profit_candidate", "profit_validation", "profit_validated_signature",
+        "current_weekly_order_signature", "selected_close_month",
+        "reset_pending", "reset_all_pending",
+    ]:
+        st.session_state.pop(key, None)
+    st.session_state.upload_generation = st.session_state.get("upload_generation", 0) + 1
+    st.session_state.weekly_order_generation = st.session_state.get("weekly_order_generation", 0) + 1
+    st.rerun()
+
+
 if st.session_state.get("app_data_version") != APP_DATA_VERSION:
     st.session_state.active_bundle = blank_bundle()
     st.session_state.app_data_version = APP_DATA_VERSION
@@ -1247,7 +1298,7 @@ if "current_weekly_order" not in st.session_state:
 if "storage_command" not in st.session_state:
     st.session_state.storage_command = {"action": "load", "revision": "initial", "payload": ""}
 command = st.session_state.storage_command
-storage_result = browser_store(**command, storage_key="control-comercial-corte-v1", key="saved_commercial_cut")
+storage_result = browser_store(**command, storage_key=commercial_storage_key, key=f"saved_commercial_cut_{company_slug}")
 if isinstance(storage_result, dict):
     if storage_result.get("action") == "loaded" and not st.session_state.get("storage_loaded"):
         st.session_state.storage_loaded = True
@@ -1276,9 +1327,9 @@ if "profit_storage_command" not in st.session_state:
 profit_command = st.session_state.profit_storage_command
 profit_storage_result = browser_store(
     **profit_command,
-    storage_key="control-comercial-rentabilidad-v1",
-    fallback_key="control-comercial-corte-v1",
-    key="saved_profitability_cuts",
+    storage_key=profit_storage_key,
+    fallback_key="control-comercial-corte-v1" if commercial_company == "ZICO" else "",
+    key=f"saved_profitability_cuts_{company_slug}",
 )
 if isinstance(profit_storage_result, dict):
     if profit_storage_result.get("action") == "loaded" and not st.session_state.get("profit_storage_loaded"):
@@ -1313,8 +1364,8 @@ if "close_storage_command" not in st.session_state:
 close_command = st.session_state.close_storage_command
 close_storage_result = browser_store(
     **close_command,
-    storage_key="control-comercial-cierres-v1",
-    key="saved_month_closures",
+    storage_key=close_storage_key,
+    key=f"saved_month_closures_{company_slug}",
 )
 if isinstance(close_storage_result, dict):
     if close_storage_result.get("action") == "loaded" and not st.session_state.get("close_storage_loaded"):
@@ -1362,7 +1413,7 @@ if st.session_state.get("profit_storage_loaded") and st.session_state.get("close
         history_costs = history_cut.get("costs", pd.DataFrame())
         history_snapshot = build_close_snapshot(
             history_key,
-            (existing_history or {}).get("budget", DEFAULT_MONTHLY_BUDGETS.get(history_key, 0)),
+            (existing_history or {}).get("budget", company_monthly_budgets.get(history_key, 0)),
             history_invoices,
             history_costs,
         )
@@ -1386,8 +1437,8 @@ if st.session_state.get("profit_storage_loaded") and st.session_state.get("close
         st.rerun()
 
 with st.sidebar:
-    st.header("Actualizar información")
-    st.caption("El corte validado se guarda en este navegador y vuelve al refrescar. No se comparte con otros usuarios. Conserve también sus archivos originales.")
+    st.header(f"Actualizar información · {commercial_company}")
+    st.caption(f"Este espacio pertenece únicamente a {commercial_company}. Sus datos no se mezclan con la otra empresa. El corte validado se guarda en este navegador y vuelve al refrescar.")
     if st.session_state.get("storage_notice"):
         st.info(st.session_state.pop("storage_notice"))
     has_current_data = not st.session_state.active_bundle["forecast"].empty
@@ -1421,7 +1472,8 @@ with st.sidebar:
         st.session_state.reset_all_pending = True
     if st.session_state.get("reset_all_pending"):
         st.error(
-            "Se eliminarán el corte comercial, Forecast, stock, facturas, Rentabilidad y todos los cierres guardados en este navegador. "
+            f"Se eliminarán únicamente los datos de {commercial_company}: corte comercial, Forecast, stock, facturas, Rentabilidad y cierres guardados. "
+            "La información de la otra empresa no se modificará. "
             "Los archivos originales de su computadora no se borrarán."
         )
         delete_col, keep_col = st.columns(2)
@@ -1444,7 +1496,7 @@ with st.sidebar:
                 "current_weekly_order_signature", "selected_close_month",
             ]:
                 st.session_state.pop(key, None)
-            st.session_state.storage_notice = "Toda la información guardada fue eliminada. Ya puede cargar septiembre y octubre desde cero."
+            st.session_state.storage_notice = f"Toda la información de {commercial_company} fue eliminada. La otra empresa se conserva."
             st.rerun()
         if keep_col.button("Cancelar borrado", use_container_width=True):
             st.session_state.pop("reset_all_pending", None)
@@ -1546,7 +1598,7 @@ fill_rate_invoice_df = active.get("fill_rate_invoices", blank_bundle()["fill_rat
 orders_df = active.get("orders", blank_bundle()["orders"])
 
 if forecast_df.empty or stock_df.empty or invoice_df.empty:
-    st.markdown('<div class="hero"><h1>Control comercial</h1><p>Comience un nuevo mes cargando la información.</p></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="hero"><h1>Control comercial · {commercial_company}</h1><p>Comience un nuevo mes cargando la información exclusiva de {commercial_company}.</p></div>', unsafe_allow_html=True)
     st.title("La aplicación está en blanco")
     st.write("Para crear el análisis del mes, cargue en el panel izquierdo:")
     st.write("1. **Forecast del mes** en Excel")
@@ -1563,7 +1615,7 @@ analysis, elapsed = build_analysis(forecast_df, stock_df, invoice_df, cutoff)
 sold_forecast = analysis.loc[analysis["forecast"].notna(), "sold"].sum()
 forecast_total = analysis["forecast"].fillna(0).sum()
 
-st.markdown(f'<div class="hero"><h1>Control comercial</h1><p>{source_label}. Vea qué pasa y qué hacer.</p></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="hero"><h1>Control comercial · {commercial_company}</h1><p>{source_label}. Vea qué pasa y qué hacer.</p></div>', unsafe_allow_html=True)
 
 # KPIs ejecutivos del resumen: venta, forecast asegurado y riesgo de inventario.
 summary_analysis = analysis.copy()
@@ -1652,7 +1704,7 @@ else:
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "Resumen", "Qué hacer", "Todos los productos", "Facturas", "Ventas por cliente",
-    "Pedido semanal", "Fill Rate", "Rentabilidad", "Cierre de mes ZICO", "Cierre de mes DISLUB",
+    "Pedido semanal", "Fill Rate", "Rentabilidad", f"Cierre de mes {commercial_company}", "Comparador DISLUB",
 ])
 
 with tab1:
@@ -2897,7 +2949,7 @@ with tab8:
 
 with tab9:
     st.markdown(
-        '<div class="close-title"><h2>🧾 Cierre de mes ZICO</h2><p>La historia sencilla del mes: cuánto vendimos, cuánto ganamos y qué debemos mejorar.</p></div>',
+        f'<div class="close-title"><h2>🧾 Cierre de mes {commercial_company}</h2><p>La historia sencilla del mes: cuánto vendimos, cuánto ganamos y qué debemos mejorar.</p></div>',
         unsafe_allow_html=True,
     )
     if st.session_state.get("close_notice"):
@@ -2951,7 +3003,7 @@ with tab9:
 
     if is_live_month:
         setup_left, setup_right = st.columns([2, 1])
-        budget_default = float((saved_snapshot or {}).get("budget", DEFAULT_MONTHLY_BUDGETS.get(selected_close_month, 0)))
+        budget_default = float((saved_snapshot or {}).get("budget", company_monthly_budgets.get(selected_close_month, 0)))
         monthly_budget = setup_left.number_input(
             "🎯 Presupuesto de venta del mes ($)",
             min_value=0.0,
