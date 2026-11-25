@@ -226,6 +226,43 @@ def read_forecast(file):
     return df
 
 
+def read_daily_forecast(file, first_year):
+    raw = pd.read_excel(io.BytesIO(file.getvalue()), sheet_name=0)
+    if list(raw.columns[:3]) != ["Código", "Producto", "UM plan"]:
+        raise ValueError("El forecast diario debe comenzar con Código, Producto y UM plan.")
+    dates = {}
+    year, previous_month = first_year, None
+    for column in raw.columns[3:]:
+        match = re.fullmatch(r"[^\d]+?\s+(\d{1,2})/(\d{1,2})", str(column))
+        if not match or str(column).casefold().startswith("cajas "):
+            continue
+        day, month = map(int, match.groups())
+        if previous_month == 12 and month == 1:
+            year += 1
+        date = pd.Timestamp(year, month, day)
+        if dates and date != next(reversed(dates)) + pd.Timedelta(days=1):
+            raise ValueError("Las fechas del forecast diario deben ser consecutivas.")
+        dates[date] = column
+        previous_month = month
+    if not dates:
+        raise ValueError("No encontré columnas diarias de unidades.")
+    return raw, dates
+
+
+def aggregate_daily_forecast(raw, dates, month, sku_overrides):
+    selected = {date: column for date, column in dates.items() if str(date.to_period("M")) == month}
+    result = raw.iloc[:, :3].copy()
+    result.columns = ["code", "product", "handling_unit"]
+    result["forecast"] = raw[list(selected.values())].apply(pd.to_numeric, errors="raise").sum(axis=1)
+    for row, code in sku_overrides.items():
+        result.loc[row, "code"] = code or None
+    result["code"] = result["code"].map(norm_code)
+    result = result.loc[result["code"].notna() | result["forecast"].ne(0)].copy()
+    result["forecast_start"] = min(selected).strftime("%Y-%m-%d")
+    result["forecast_end"] = max(selected).strftime("%Y-%m-%d")
+    return result
+
+
 def read_stock(file):
     raw = pd.read_excel(file, sheet_name=0)
     raw.columns = ["product", "location", "lot", "available", "quantity", "expiry", "uom", "company"]
@@ -812,7 +849,7 @@ def unpack_bundle(encoded):
     return bundle
 
 
-def build_analysis(forecast, stock, invoices, cutoff):
+def build_analysis(forecast, stock, invoices, cutoff, forecast_period=None):
     # Las exportaciones 001-901 se informan por separado, pero pertenecen a
     # otro plan comercial y no consumen el forecast nacional del mes.
     forecast_invoices = invoices[
@@ -832,11 +869,19 @@ def build_analysis(forecast, stock, invoices, cutoff):
         master[col] = pd.to_numeric(master[col], errors="coerce").fillna(0)
     month_days = cutoff.days_in_month
     elapsed = cutoff.day / month_days
+    days_remaining = month_days - cutoff.day
+    days_observed = cutoff.day
+    if forecast_period:
+        start, end = forecast_period
+        month_days = (end - start).days + 1
+        days_observed = max(0, min(month_days, (cutoff.normalize() - start).days + 1))
+        elapsed = days_observed / month_days
+        days_remaining = month_days - days_observed
     master["advance"] = master["sold"] / master["forecast"].replace(0, pd.NA)
     master["remaining"] = (master["forecast"].fillna(0) - master["sold"]).clip(lower=0)
     master["missing_stock"] = (master["remaining"] - master["available"]).clip(lower=0)
-    master["needed_per_day"] = master["remaining"] / max(month_days - cutoff.day, 1)
-    master["projection"] = master["sold"] / max(cutoff.day, 1) * month_days
+    master["needed_per_day"] = master["remaining"] / max(days_remaining, 1)
+    master["projection"] = master["sold"] / max(days_observed, 1) * month_days
 
     def status(row):
         if pd.isna(row["forecast"]):
@@ -1504,6 +1549,37 @@ with st.sidebar:
 
     generation = st.session_state.upload_generation
     forecast_file = st.file_uploader("Forecast (.xlsx)", type="xlsx", key=f"forecast_{generation}")
+    daily_candidate, daily_error = None, None
+    daily_month, first_year = None, None
+    sku_overrides = {}
+    if forecast_file and commercial_company == "DISLUB" and st.checkbox(
+        "Forecast diario", value=True, key=f"daily_forecast_{generation}"
+    ):
+        first_year = st.number_input(
+            "Año de la primera fecha del archivo", min_value=2000, max_value=2100,
+            value=2026, step=1, key=f"forecast_year_{generation}",
+        )
+        try:
+            raw_daily, daily_dates = read_daily_forecast(forecast_file, int(first_year))
+            daily_month = st.selectbox(
+                "Mes del forecast",
+                list(dict.fromkeys(str(date.to_period("M")) for date in daily_dates)),
+                key=f"forecast_month_{generation}",
+            )
+            preview = aggregate_daily_forecast(raw_daily, daily_dates, daily_month, {})
+            for row, product in preview.loc[preview["code"].isna(), "product"].items():
+                sku_overrides[row] = st.text_input(
+                    f"SKU de {product}", key=f"daily_sku_{daily_month}_{generation}_{row}",
+                ).strip()
+            if any(not re.fullmatch(r"\d{7,8}", code) for code in sku_overrides.values()):
+                raise ValueError("Complete los SKU pendientes con el código de Odoo.")
+            daily_candidate = aggregate_daily_forecast(raw_daily, daily_dates, daily_month, sku_overrides)
+            start, end = map(pd.Timestamp, daily_candidate[["forecast_start", "forecast_end"]].iloc[0])
+            coverage = "mes completo" if start.day == 1 and end.day == end.days_in_month else "periodo parcial"
+            st.caption(f"{start:%d/%m/%Y} al {end:%d/%m/%Y} · {coverage} · {daily_candidate['forecast'].sum():,.0f} unidades")
+        except (ValueError, IndexError) as exc:
+            daily_error = str(exc)
+            st.warning(daily_error)
     stock_file = st.file_uploader("Stock (.xlsx)", type="xlsx", key=f"stock_{generation}")
     pdf_files = st.file_uploader(
         "Facturas nuevas (.pdf)", type="pdf", accept_multiple_files=True, key=f"pdf_{generation}"
@@ -1513,6 +1589,7 @@ with st.sidebar:
         file_signature(forecast_file),
         file_signature(stock_file),
         tuple(file_signature(file) for file in pdf_files or []),
+        first_year, daily_month, tuple(sku_overrides.items()),
     )
     if st.session_state.get("validated_signature") != signature:
         st.session_state.pop("validated_bundle", None)
@@ -1521,7 +1598,12 @@ with st.sidebar:
     if st.button("Prevalidar información", type="primary", use_container_width=True):
         try:
             active = st.session_state.active_bundle
-            candidate_forecast = read_forecast(forecast_file) if forecast_file else active["forecast"].copy()
+            if daily_error:
+                raise ValueError(daily_error)
+            if daily_candidate is not None:
+                candidate_forecast = daily_candidate
+            else:
+                candidate_forecast = read_forecast(forecast_file) if forecast_file else active["forecast"].copy()
             if stock_file:
                 candidate_stock, candidate_lots = read_stock(stock_file)
             else:
@@ -1608,14 +1690,23 @@ if forecast_df.empty or stock_df.empty or invoice_df.empty:
     st.stop()
 
 cutoff = pd.Timestamp(active["cutoff"])
+forecast_period = None
+if commercial_company == "DISLUB" and {"forecast_start", "forecast_end"}.issubset(forecast_df):
+    start, end = map(pd.Timestamp, forecast_df[["forecast_start", "forecast_end"]].iloc[0])
+    forecast_period = (start, end)
+    invoice_dates = pd.to_datetime(invoice_df["date"]).dt.normalize()
+    invoice_df = invoice_df.loc[invoice_dates.between(start, end)].copy()
 month_names = {1:"enero", 2:"febrero", 3:"marzo", 4:"abril", 5:"mayo", 6:"junio", 7:"julio", 8:"agosto", 9:"septiembre", 10:"octubre", 11:"noviembre", 12:"diciembre"}
 source_label = f"Corte actual: {cutoff.day} de {month_names[cutoff.month]} de {cutoff.year}"
 
-analysis, elapsed = build_analysis(forecast_df, stock_df, invoice_df, cutoff)
+analysis, elapsed = build_analysis(forecast_df, stock_df, invoice_df, cutoff, forecast_period)
 sold_forecast = analysis.loc[analysis["forecast"].notna(), "sold"].sum()
 forecast_total = analysis["forecast"].fillna(0).sum()
 
 st.markdown(f'<div class="hero"><h1>Control comercial · {commercial_company}</h1><p>{source_label}. Vea qué pasa y qué hacer.</p></div>', unsafe_allow_html=True)
+if forecast_period:
+    coverage = "mes completo" if start.day == 1 and end.day == end.days_in_month else "periodo parcial"
+    st.caption(f"Forecast del {start:%d/%m/%Y} al {end:%d/%m/%Y} · {coverage}. Solo se cuentan facturas de esas fechas.")
 
 # KPIs ejecutivos del resumen: venta, forecast asegurado y riesgo de inventario.
 summary_analysis = analysis.copy()
@@ -1671,7 +1762,7 @@ summary_critical_skus = int(summary_analysis["summary_critical"].sum())
 summary_missing_units = float(summary_analysis["missing_stock"].sum())
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Forecast del mes", f"{forecast_total:,.0f} un.")
+c1.metric("Forecast del periodo" if forecast_period else "Forecast del mes", f"{forecast_total:,.0f} un.")
 c2.metric(
     "Facturado contra forecast",
     f"{sold_forecast:,.0f} un.",
@@ -1697,7 +1788,11 @@ c6.metric(
     f"{summary_missing_units:,.0f} un.",
     help="Unidades adicionales requeridas para tener capacidad de cumplir el forecast pendiente.",
 )
-if sold_forecast / forecast_total > elapsed:
+if not forecast_total:
+    st.info("El forecast seleccionado suma cero unidades.")
+elif forecast_period:
+    st.info(f"Se facturó el {sold_forecast / forecast_total:.1%} del forecast y ha transcurrido el {elapsed:.1%} del periodo al corte de facturación.")
+elif sold_forecast / forecast_total > elapsed:
     st.success(f"En general vamos adelantados: se vendió {sold_forecast / forecast_total:.1%} del forecast y ha pasado {elapsed:.1%} del mes.")
 else:
     st.warning(f"En general vamos atrasados: se vendió {sold_forecast / forecast_total:.1%} del forecast y ha pasado {elapsed:.1%} del mes.")
@@ -3022,7 +3117,7 @@ with tab9:
             close_costs = profit_cut.get("costs", pd.DataFrame())
             source_message = "Usamos las facturas y costos guardados en Rentabilidad."
         else:
-            close_invoices = invoice_df
+            close_invoices = active["invoices"]
             close_costs = pd.DataFrame()
             source_message = "Usamos las facturas del corte comercial. Carga Rentabilidad para incluir costos y notas de crédito con mayor precisión."
         live_snapshot = build_close_snapshot(selected_close_month, monthly_budget, close_invoices, close_costs)
@@ -3170,8 +3265,8 @@ with tab9:
             profit_invoices = month_cut.get("invoices", pd.DataFrame())
             if profit_invoices is not None and not profit_invoices.empty:
                 candidates.append(("Rentabilidad", profit_invoices.copy()))
-            if invoice_df is not None and not invoice_df.empty:
-                candidates.append(("Facturas del corte comercial", invoice_df.copy()))
+            if not active["invoices"].empty:
+                candidates.append(("Facturas del corte comercial", active["invoices"].copy()))
 
             product_catalog = pd.concat(
                 [frame[["code", "product"]] for frame in (forecast_df, stock_df)
